@@ -1,0 +1,18 @@
+# Model binaries & local caches
+*.gguf
+*.safetensors
+*.pt
+*.bin
+*.state
+*.mobileprovision
+*.p12
+
+# Build & Python artifacts
+build/
+ios/build/
+third_party/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+*.log

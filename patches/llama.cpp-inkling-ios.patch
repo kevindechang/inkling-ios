@@ -1,0 +1,3719 @@
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index dc6453c..f36f0e2 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -147,6 +147,18 @@ extern "C" {
+     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
+     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
+ 
++    // opt-in Q4_K CPU_REPACK LM-head shortlist helpers (retrieved via ggml_backend_reg_get_proc_address)
++    struct ggml_cpu_lm_head_ops {
++        bool (*q4_k_repack_supported)(const struct ggml_tensor * w);
++        void (*q4_k_unrepack_row)(const struct ggml_tensor * w, int64_t row, void * dst_q4_k);
++        void (*q4_k_repack_rows)(int64_t ne0, int64_t n_rows, const void * src_q4_k, void * dst_repacked);
++        void (*q4_k_quantize_h)(int64_t ne0, const float * h_f32, void * dst_q8_k);
++        void (*q8_k_dequant)(int64_t ne0, const void * src_q8_k, float * dst_f32);
++        void (*q4_k_gemv_rows)(int64_t ne0, int64_t total_rows, const void * repacked_w,
++                               int64_t row_start, int64_t n_rows, const void * src_q8_k, float * dst);
++    };
++    typedef const struct ggml_cpu_lm_head_ops * (*ggml_cpu_lm_head_get_ops_t)(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 7c5b1e5..954d10b 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2815,6 +2815,22 @@ extern "C" {
+     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
+     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
+ 
++    // file-mapping registry: pointer into a registered memory-mapped file -> pread of the same bytes
++    GGML_API void ggml_file_map_register(const void * addr, size_t size, int fd);
++    GGML_API bool ggml_file_map_read(const void * ptr, void * dst, size_t size);
++    // one preadv of n file-adjacent ranges starting at ptr into n separate buffers (Atomic Engine adjacent read layout)
++    GGML_API bool ggml_file_map_readv(const void * ptr, void * const * dst, const size_t * size, int n);
++
++    // expert matmul pairs: the gate_up and down weights of one MoE layer use the same selected experts,
++    // registered at graph build so the CPU expert cache can read the down slices ahead (env GGML_MMID_OVERLAP)
++    GGML_API void ggml_mmid_register_pair(const struct ggml_tensor * gate_up, const struct ggml_tensor * down);
++    GGML_API bool ggml_mmid_get_pair(const void * gate_up_data, const char ** down_data, size_t * down_nb2);
++    GGML_API bool ggml_mmid_get_pair_meta(const void * gate_up_data, const char ** down_data, size_t * down_nb2,
++                                          enum ggml_type * down_type, int64_t * down_ne0, int64_t * down_ne1);
++    // CECAR decoupled cache-bonus routing: map router argsort node -> gate_up_exps tensor (opt-in GGML_MMID_CECAR_BONUS)
++    GGML_API void ggml_mmid_register_router(const struct ggml_tensor * argsort_dst, const struct ggml_tensor * gate_up);
++    GGML_API bool ggml_mmid_get_router(const struct ggml_tensor * argsort_dst, const char ** gate_up_data, size_t * gate_up_nb2);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cpu/arch/arm/repack.cpp b/ggml/src/ggml-cpu/arch/arm/repack.cpp
+index b60eff9..d9413c3 100644
+--- a/ggml/src/ggml-cpu/arch/arm/repack.cpp
++++ b/ggml/src/ggml-cpu/arch/arm/repack.cpp
+@@ -5769,3 +5769,626 @@ void ggml_gemm_q1_0_4x8_q8_0(int                        n,
+ 
+     ggml_gemm_q1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+ }
++
++// mmid expert cache 4x4 ARM NEON repack + gemv kernels (Q2_0, NVFP4, Q2_K, IQ1_S, IQ2_S/XS/XXS)
++#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++#include <mutex>
++
++namespace {
++struct pair_u32 { uint32_t lo4; uint32_t hi4; };
++
++static uint32_t g_q2_0_lut[256];
++static pair_u32 g_iq1s_lut[NGRID_IQ1S];
++static pair_u32 g_iq2s_lut[1024];
++static pair_u32 g_iq2xs_lut[512];
++static pair_u32 g_iq2xxs_lut[256];
++static pair_u32 g_byte_sgn_lut[256];
++static pair_u32 g_keven_sgn_lut[128];
++static std::once_flag g_mmid_lut_once;
++
++static inline uint8_t iq2_mag_code(uint8_t v) {
++    return v == 8 ? 0 : (v == 25 ? 1 : 2);
++}
++
++static void init_mmid_repack_luts() {
++    std::call_once(g_mmid_lut_once, []() {
++        for (int b = 0; b < 256; ++b) {
++            uint32_t w0 = (uint32_t) ((b >> 0) & 3);
++            uint32_t w1 = (uint32_t) ((b >> 2) & 3);
++            uint32_t w2 = (uint32_t) ((b >> 4) & 3);
++            uint32_t w3 = (uint32_t) ((b >> 6) & 3);
++            g_q2_0_lut[b] = w0 | (w1 << 8) | (w2 << 16) | (w3 << 24);
++
++            uint32_t slo = 0, shi = 0;
++            for (int j = 0; j < 4; ++j) {
++                if (b & (1 << j))       { slo |= (0x04u << (8 * j)); }
++                if (b & (1 << (j + 4))) { shi |= (0x04u << (8 * j)); }
++            }
++            g_byte_sgn_lut[b] = { slo, shi };
++        }
++        for (int i = 0; i < NGRID_IQ1S; ++i) {
++            const int8_t * g = (const int8_t *) (iq1s_grid + i);
++            uint32_t lo = 0, hi = 0;
++            for (int j = 0; j < 4; ++j) {
++                lo |= ((uint32_t) (g[j]     + 1) << (8 * j));
++                hi |= ((uint32_t) (g[j + 4] + 1) << (8 * j));
++            }
++            g_iq1s_lut[i] = { lo, hi };
++        }
++        auto build_iq2 = [](const uint64_t * grid, int n, pair_u32 * out) {
++            for (int i = 0; i < n; ++i) {
++                const uint8_t * g = (const uint8_t *) (grid + i);
++                uint32_t lo = 0, hi = 0;
++                for (int j = 0; j < 4; ++j) {
++                    lo |= ((uint32_t) iq2_mag_code(g[j])     << (8 * j));
++                    hi |= ((uint32_t) iq2_mag_code(g[j + 4]) << (8 * j));
++                }
++                out[i] = { lo, hi };
++            }
++        };
++        build_iq2(iq2s_grid,   1024, g_iq2s_lut);
++        build_iq2(iq2xs_grid,   512, g_iq2xs_lut);
++        build_iq2(iq2xxs_grid,  256, g_iq2xxs_lut);
++        for (int i = 0; i < 128; ++i) {
++            uint8_t s = ksigns_iq2xs[i];
++            g_keven_sgn_lut[i] = g_byte_sgn_lut[s];
++        }
++    });
++}
++} // namespace
++
++extern "C" {
++
++bool ggml_arm_mmid_has_custom_kernels(void) {
++    return true;
++}
++
++void ggml_arm_repack_q2_0_4x4(void * GGML_RESTRICT dst_v, const void * GGML_RESTRICT src_v, int64_t ne0, int64_t ne1) {
++    init_mmid_repack_luts();
++    const int64_t nb = ne0 / QK2_0;
++    const block_q2_0 * src = (const block_q2_0 *) src_v;
++    block_q2_0x4 * dst = (block_q2_0x4 *) dst_v;
++    for (int64_t r = 0; r < ne1; r += 4) {
++        for (int64_t b = 0; b < nb; ++b) {
++            block_q2_0x4 out;
++            for (int i = 0; i < 4; ++i) {
++                const block_q2_0 & in = src[(r + i) * nb + b];
++                out.d[i] = in.d;
++                for (int k = 0; k < 2; ++k) {
++                    const uint8_t * s = in.qs + k * 8;
++                    uint32_t v0 = g_q2_0_lut[s[0]] | (g_q2_0_lut[s[1]] << 2) | (g_q2_0_lut[s[2]] << 4) | (g_q2_0_lut[s[3]] << 6);
++                    uint32_t v1 = g_q2_0_lut[s[4]] | (g_q2_0_lut[s[5]] << 2) | (g_q2_0_lut[s[6]] << 4) | (g_q2_0_lut[s[7]] << 6);
++                    memcpy(out.qs + k * 32 + 0  + i * 4, &v0, 4);
++                    memcpy(out.qs + k * 32 + 16 + i * 4, &v1, 4);
++                }
++            }
++            *dst++ = out;
++        }
++    }
++}
++
++void ggml_arm_gemv_q2_0_4x4_q8_0(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    const int nb = n / QK2_0;
++    const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx;
++    const block_q8_0 * a_base = (const block_q8_0 *) vy;
++    const uint8x16_t m3 = vdupq_n_u8(0x03);
++    const int8x16_t ones = vdupq_n_s8(1);
++    const int n_q8 = nb * 2;
++    int32_t asums_buf[1024 * 4];
++    int32_t * asums = n_q8 <= 1024 ? asums_buf : (int32_t *) malloc((size_t) n_q8 * 4 * sizeof(int32_t));
++    for (int k = 0; k < n_q8; ++k) {
++        int8x16_t a0 = vld1q_s8(a_base[k].qs);
++        int8x16_t a1 = vld1q_s8(a_base[k].qs + 16);
++        int32x4_t t = vdotq_s32(vdotq_s32(vdupq_n_s32(0), a0, ones), a1, ones);
++        vst1q_s32(asums + k * 4, t);
++    }
++    // Keep 4 per-quarter accumulators so float summation matches ggml_vec_dot_q2_0_q8_0 bit-for-bit.
++    for (int c = 0; c < nc; c += 4) {
++        float32x4_t acc0 = vdupq_n_f32(0.0f);
++        float32x4_t acc1 = vdupq_n_f32(0.0f);
++        float32x4_t acc2 = vdupq_n_f32(0.0f);
++        float32x4_t acc3 = vdupq_n_f32(0.0f);
++        for (int b = 0; b < nb; ++b) {
++            float32x4_t bd = vcvt_f32_f16(vld1_f16((const __fp16 *) b_ptr->d));
++            for (int k = 0; k < 2; ++k) {
++                const block_q8_0 * ap = &a_base[2 * b + k];
++                const int32_t * as = asums + (2 * b + k) * 4;
++                uint8x16_t b0 = vld1q_u8(b_ptr->qs + k * 32 + 0);
++                uint8x16_t b1 = vld1q_u8(b_ptr->qs + k * 32 + 16);
++                int8x16_t a0 = vld1q_s8(ap->qs + 0);
++                int8x16_t a1 = vld1q_s8(ap->qs + 16);
++                int32x4_t p0 = vdupq_n_s32(-as[0]);
++                int32x4_t p1 = vdupq_n_s32(-as[1]);
++                int32x4_t p2 = vdupq_n_s32(-as[2]);
++                int32x4_t p3 = vdupq_n_s32(-as[3]);
++                p0 = vdotq_laneq_s32(p0, vreinterpretq_s8_u8(vandq_u8(b0, m3)),               a0, 0);
++                p1 = vdotq_laneq_s32(p1, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b0, 2), m3)), a0, 1);
++                p2 = vdotq_laneq_s32(p2, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b0, 4), m3)), a0, 2);
++                p3 = vdotq_laneq_s32(p3, vreinterpretq_s8_u8(vshrq_n_u8(b0, 6)),               a0, 3);
++                p0 = vdotq_laneq_s32(p0, vreinterpretq_s8_u8(vandq_u8(b1, m3)),               a1, 0);
++                p1 = vdotq_laneq_s32(p1, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b1, 2), m3)), a1, 1);
++                p2 = vdotq_laneq_s32(p2, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b1, 4), m3)), a1, 2);
++                p3 = vdotq_laneq_s32(p3, vreinterpretq_s8_u8(vshrq_n_u8(b1, 6)),               a1, 3);
++                float32x4_t d = vmulq_n_f32(bd, GGML_CPU_FP16_TO_FP32(ap->d));
++                acc0 = vmlaq_f32(acc0, vcvtq_f32_s32(p0), d);
++                acc1 = vmlaq_f32(acc1, vcvtq_f32_s32(p1), d);
++                acc2 = vmlaq_f32(acc2, vcvtq_f32_s32(p2), d);
++                acc3 = vmlaq_f32(acc3, vcvtq_f32_s32(p3), d);
++            }
++            b_ptr++;
++        }
++        vst1q_f32(s + c, vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
++    }
++    if (asums != asums_buf) { free(asums); }
++}
++
++void ggml_arm_repack_nvfp4_4x4(void * GGML_RESTRICT dst_v, const void * GGML_RESTRICT src_v, int64_t ne0, int64_t ne1) {
++    const int64_t nb = ne0 / QK_NVFP4;
++    const block_nvfp4 * src = (const block_nvfp4 *) src_v;
++    block_nvfp4x4 * dst = (block_nvfp4x4 *) dst_v;
++    for (int64_t r = 0; r < ne1; r += 4) {
++        for (int64_t b = 0; b < nb; ++b) {
++            block_nvfp4x4 out;
++            for (int i = 0; i < 4; ++i) {
++                const block_nvfp4 & in = src[(r + i) * nb + b];
++                for (int sb = 0; sb < 4; ++sb) {
++                    out.d[sb * 4 + i] = in.d[sb];
++                    memcpy(out.qs + sb * 32 + 0  + i * 4, in.qs + sb * 8 + 0, 4);
++                    memcpy(out.qs + sb * 32 + 16 + i * 4, in.qs + sb * 8 + 4, 4);
++                }
++            }
++            *dst++ = out;
++        }
++    }
++}
++
++void ggml_arm_gemv_nvfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    const int nb = n / QK_NVFP4;
++    const block_nvfp4x4 * b_ptr = (const block_nvfp4x4 *) vx;
++    const block_q8_0 * a_base = (const block_q8_0 *) vy;
++    const int8x16_t kvals = vld1q_s8(kvalues_mxfp4);
++    const uint8x16_t m4b = vdupq_n_u8(0x0f);
++    // Keep 4 per-subblock accumulators so float summation matches ggml_vec_dot_nvfp4_q8_0 bit-for-bit.
++    for (int c = 0; c < nc; c += 4) {
++        float32x4_t acc[4] = {
++            vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)
++        };
++        for (int b = 0; b < nb; ++b) {
++            const float dy[2] = { GGML_CPU_FP16_TO_FP32(a_base[2 * b + 0].d), GGML_CPU_FP16_TO_FP32(a_base[2 * b + 1].d) };
++            for (int sb = 0; sb < 4; ++sb) {
++                const int8_t * qp = a_base[2 * b + (sb >> 1)].qs + (sb & 1) * 16;
++                int8x16_t a_sb = vld1q_s8(qp);
++                uint8x16_t b0 = vld1q_u8(b_ptr->qs + sb * 32 + 0);
++                uint8x16_t b1 = vld1q_u8(b_ptr->qs + sb * 32 + 16);
++                int32x4_t sumi = vdupq_n_s32(0);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b0, m4b)), a_sb, 0);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b1, m4b)), a_sb, 1);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b0, 4)), a_sb, 2);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b1, 4)), a_sb, 3);
++                const uint8_t * dp = b_ptr->d + sb * 4;
++                float32x4_t sc = {
++                    GGML_CPU_UE4M3_TO_FP32(dp[0]),
++                    GGML_CPU_UE4M3_TO_FP32(dp[1]),
++                    GGML_CPU_UE4M3_TO_FP32(dp[2]),
++                    GGML_CPU_UE4M3_TO_FP32(dp[3]),
++                };
++                acc[sb] = vfmaq_f32(acc[sb], vcvtq_f32_s32(sumi), vmulq_n_f32(sc, dy[sb >> 1]));
++            }
++            b_ptr++;
++        }
++        vst1q_f32(s + c, vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])));
++    }
++}
++
++void ggml_arm_gemv_mxfp4_4x4_q8_0_exact(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    const int nb = n / QK8_0;
++    const int8x16_t kvals = vld1q_s8(kvalues_mxfp4);
++    const uint8x16_t m4b = vdupq_n_u8(0x0f);
++    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
++    // Match ggml_vec_dot_mxfp4_q8_0 paired block accumulation bit-for-bit.
++    for (int x = 0; x < nc / 4; ++x) {
++        const block_mxfp4x4 * b_ptr = (const block_mxfp4x4 *) vx + x * nb;
++        float32x4_t sumf = vdupq_n_f32(0.0f);
++        int l = 0;
++        for (; l + 1 < nb; l += 2) {
++            auto blk_ds = [&](int idx, float32x4_t & out_d, float32x4_t & out_s) {
++                uint8x16_t b0 = vld1q_u8(b_ptr[idx].qs +  0);
++                uint8x16_t b1 = vld1q_u8(b_ptr[idx].qs + 16);
++                uint8x16_t b2 = vld1q_u8(b_ptr[idx].qs + 32);
++                uint8x16_t b3 = vld1q_u8(b_ptr[idx].qs + 48);
++                int8x16_t a0 = vld1q_s8(a_ptr[idx].qs +  0);
++                int8x16_t a1 = vld1q_s8(a_ptr[idx].qs + 16);
++                int32x4_t sumi = vdupq_n_s32(0);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b0, m4b)), a0, 0);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b0, 4)), a1, 0);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b1, m4b)), a0, 1);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b1, 4)), a1, 1);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b2, m4b)), a0, 2);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b2, 4)), a1, 2);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b3, m4b)), a0, 3);
++                sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b3, 4)), a1, 3);
++                float32x4_t bd = {
++                    GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[idx].e[0]),
++                    GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[idx].e[1]),
++                    GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[idx].e[2]),
++                    GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[idx].e[3]),
++                };
++                out_d = vmulq_n_f32(bd, GGML_CPU_FP16_TO_FP32(a_ptr[idx].d));
++                out_s = vcvtq_f32_s32(sumi);
++            };
++            float32x4_t d0, s0, d1, s1;
++            blk_ds(l + 0, d0, s0);
++            blk_ds(l + 1, d1, s1);
++            float32x4_t pair = vfmaq_f32(vmulq_f32(d1, s1), d0, s0);
++            sumf = vaddq_f32(sumf, pair);
++        }
++        for (; l < nb; ++l) {
++            uint8x16_t b0 = vld1q_u8(b_ptr[l].qs +  0);
++            uint8x16_t b1 = vld1q_u8(b_ptr[l].qs + 16);
++            uint8x16_t b2 = vld1q_u8(b_ptr[l].qs + 32);
++            uint8x16_t b3 = vld1q_u8(b_ptr[l].qs + 48);
++            int8x16_t a0 = vld1q_s8(a_ptr[l].qs +  0);
++            int8x16_t a1 = vld1q_s8(a_ptr[l].qs + 16);
++            int32x4_t sumi = vdupq_n_s32(0);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b0, m4b)), a0, 0);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b0, 4)), a1, 0);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b1, m4b)), a0, 1);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b1, 4)), a1, 1);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b2, m4b)), a0, 2);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b2, 4)), a1, 2);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vandq_u8(b3, m4b)), a0, 3);
++            sumi = vdotq_laneq_s32(sumi, vqtbl1q_s8(kvals, vshrq_n_u8(b3, 4)), a1, 3);
++            float32x4_t bd = {
++                GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[l].e[0]),
++                GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[l].e[1]),
++                GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[l].e[2]),
++                GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[l].e[3]),
++            };
++            float32x4_t d = vmulq_n_f32(bd, GGML_CPU_FP16_TO_FP32(a_ptr[l].d));
++            sumf = vaddq_f32(sumf, vmulq_f32(d, vcvtq_f32_s32(sumi)));
++        }
++        vst1q_f32(s + x * 4, sumf);
++    }
++}
++
++void ggml_arm_repack_q2_K_4x4(void * GGML_RESTRICT dst_v, const void * GGML_RESTRICT src_v, int64_t ne0, int64_t ne1) {
++    const int64_t nb = ne0 / QK_K;
++    const block_q2_K * src = (const block_q2_K *) src_v;
++    block_q2_Kx4 * dst = (block_q2_Kx4 *) dst_v;
++    for (int64_t r = 0; r < ne1; r += 4) {
++        const block_q2_K * s0 = src + (r + 0) * nb;
++        const block_q2_K * s1 = src + (r + 1) * nb;
++        const block_q2_K * s2 = src + (r + 2) * nb;
++        const block_q2_K * s3 = src + (r + 3) * nb;
++        for (int64_t b = 0; b < nb; ++b) {
++            dst->d[0]    = s0[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
++            dst->d[1]    = s1[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
++            dst->d[2]    = s2[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
++            dst->d[3]    = s3[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
++            dst->dmin[0] = s0[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin;
++            dst->dmin[1] = s1[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin;
++            dst->dmin[2] = s2[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin;
++            dst->dmin[3] = s3[b].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin;
++            uint8x16x4_t sc;
++            sc.val[0] = vld1q_u8(s0[b].scales);
++            sc.val[1] = vld1q_u8(s1[b].scales);
++            sc.val[2] = vld1q_u8(s2[b].scales);
++            sc.val[3] = vld1q_u8(s3[b].scales);
++            vst4q_u8(dst->scales, sc);
++            for (int c = 0; c < 4; ++c) {
++                uint32x4x4_t qv;
++                qv.val[0] = vreinterpretq_u32_u8(vld1q_u8(s0[b].qs + c * 16));
++                qv.val[1] = vreinterpretq_u32_u8(vld1q_u8(s1[b].qs + c * 16));
++                qv.val[2] = vreinterpretq_u32_u8(vld1q_u8(s2[b].qs + c * 16));
++                qv.val[3] = vreinterpretq_u32_u8(vld1q_u8(s3[b].qs + c * 16));
++                vst4q_u32((uint32_t *) (dst->qs + c * 64), qv);
++            }
++            ++dst;
++        }
++    }
++}
++
++void ggml_arm_gemv_q2_K_4x4_q8_K(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    const int nb = n / QK_K;
++    const block_q2_Kx4 * b_ptr = (const block_q2_Kx4 *) vx;
++    const block_q8_K * a_base = (const block_q8_K *) vy;
++    const uint8x16_t m3 = vdupq_n_u8(0x03);
++    for (int c = 0; c < nc; c += 4) {
++        float32x4_t acc = vdupq_n_f32(0.0f);
++        for (int b = 0; b < nb; ++b) {
++            const block_q8_K * ap = &a_base[b];
++            int32x4_t msum = vdupq_n_s32(0);
++            for (int is = 0; is < 16; ++is) {
++                const uint8_t * sp = b_ptr->scales + is * 4;
++                int32x4_t mv = { (int32_t)(sp[0] >> 4), (int32_t)(sp[1] >> 4), (int32_t)(sp[2] >> 4), (int32_t)(sp[3] >> 4) };
++                msum = vmlaq_n_s32(msum, mv, (int32_t) ap->bsums[is]);
++            }
++            float32x4_t bdmin = vmulq_n_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) b_ptr->dmin)), ap->d);
++            acc = vmlsq_f32(acc, vcvtq_f32_s32(msum), bdmin);
++
++            int32x4_t isum = vdupq_n_s32(0);
++            for (int j = 0; j < 2; ++j) {
++                const uint8_t * qp = b_ptr->qs + j * 128;
++                uint8x16_t q0 = vld1q_u8(qp +  0); uint8x16_t q1 = vld1q_u8(qp + 16);
++                uint8x16_t q2 = vld1q_u8(qp + 32); uint8x16_t q3 = vld1q_u8(qp + 48);
++                uint8x16_t q4 = vld1q_u8(qp + 64); uint8x16_t q5 = vld1q_u8(qp + 80);
++                uint8x16_t q6 = vld1q_u8(qp + 96); uint8x16_t q7 = vld1q_u8(qp + 112);
++                const int is_base = j * 8;
++                auto step_pair = [&](int t, uint8x16_t u0, uint8x16_t u1, uint8x16_t u2, uint8x16_t u3,
++                                            uint8x16_t v0, uint8x16_t v1, uint8x16_t v2, uint8x16_t v3) {
++                    const int is0 = is_base + 2 * t;
++                    const int is1 = is0 + 1;
++                    int8x16_t a0 = vld1q_s8(ap->qs + is0 * 16);
++                    int8x16_t a1 = vld1q_s8(ap->qs + is1 * 16);
++                    int32x4_t p0 = vdupq_n_s32(0);
++                    p0 = vdotq_laneq_s32(p0, vreinterpretq_s8_u8(u0), a0, 0);
++                    p0 = vdotq_laneq_s32(p0, vreinterpretq_s8_u8(u1), a0, 1);
++                    p0 = vdotq_laneq_s32(p0, vreinterpretq_s8_u8(u2), a0, 2);
++                    p0 = vdotq_laneq_s32(p0, vreinterpretq_s8_u8(u3), a0, 3);
++                    int32x4_t p1 = vdupq_n_s32(0);
++                    p1 = vdotq_laneq_s32(p1, vreinterpretq_s8_u8(v0), a1, 0);
++                    p1 = vdotq_laneq_s32(p1, vreinterpretq_s8_u8(v1), a1, 1);
++                    p1 = vdotq_laneq_s32(p1, vreinterpretq_s8_u8(v2), a1, 2);
++                    p1 = vdotq_laneq_s32(p1, vreinterpretq_s8_u8(v3), a1, 3);
++                    const uint8_t * s0 = b_ptr->scales + is0 * 4;
++                    const uint8_t * s1 = b_ptr->scales + is1 * 4;
++                    int32x4_t sc0 = { (int32_t)(s0[0] & 0xf), (int32_t)(s0[1] & 0xf), (int32_t)(s0[2] & 0xf), (int32_t)(s0[3] & 0xf) };
++                    int32x4_t sc1 = { (int32_t)(s1[0] & 0xf), (int32_t)(s1[1] & 0xf), (int32_t)(s1[2] & 0xf), (int32_t)(s1[3] & 0xf) };
++                    isum = vmlaq_s32(isum, p0, sc0);
++                    isum = vmlaq_s32(isum, p1, sc1);
++                };
++                step_pair(0, vandq_u8(q0, m3), vandq_u8(q1, m3), vandq_u8(q2, m3), vandq_u8(q3, m3),
++                             vandq_u8(q4, m3), vandq_u8(q5, m3), vandq_u8(q6, m3), vandq_u8(q7, m3));
++                step_pair(1, vandq_u8(vshrq_n_u8(q0, 2), m3), vandq_u8(vshrq_n_u8(q1, 2), m3),
++                             vandq_u8(vshrq_n_u8(q2, 2), m3), vandq_u8(vshrq_n_u8(q3, 2), m3),
++                             vandq_u8(vshrq_n_u8(q4, 2), m3), vandq_u8(vshrq_n_u8(q5, 2), m3),
++                             vandq_u8(vshrq_n_u8(q6, 2), m3), vandq_u8(vshrq_n_u8(q7, 2), m3));
++                step_pair(2, vandq_u8(vshrq_n_u8(q0, 4), m3), vandq_u8(vshrq_n_u8(q1, 4), m3),
++                             vandq_u8(vshrq_n_u8(q2, 4), m3), vandq_u8(vshrq_n_u8(q3, 4), m3),
++                             vandq_u8(vshrq_n_u8(q4, 4), m3), vandq_u8(vshrq_n_u8(q5, 4), m3),
++                             vandq_u8(vshrq_n_u8(q6, 4), m3), vandq_u8(vshrq_n_u8(q7, 4), m3));
++                step_pair(3, vshrq_n_u8(q0, 6), vshrq_n_u8(q1, 6), vshrq_n_u8(q2, 6), vshrq_n_u8(q3, 6),
++                             vshrq_n_u8(q4, 6), vshrq_n_u8(q5, 6), vshrq_n_u8(q6, 6), vshrq_n_u8(q7, 6));
++            }
++            float32x4_t bd = vmulq_n_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) b_ptr->d)), ap->d);
++            acc = vfmaq_f32(acc, vcvtq_f32_s32(isum), bd);
++            b_ptr++;
++        }
++        vst1q_f32(s + c, acc);
++    }
++}
++
++void ggml_arm_repack_iq1_s_4x4(void * GGML_RESTRICT dst_v, const void * GGML_RESTRICT src_v, int64_t ne0, int64_t ne1) {
++    init_mmid_repack_luts();
++    const int64_t nb = ne0 / QK_K;
++    const block_iq1_s * src = (const block_iq1_s *) src_v;
++    block_iq1_sx4 * dst = (block_iq1_sx4 *) dst_v;
++    for (int64_t r = 0; r < ne1; r += 4) {
++        for (int64_t b = 0; b < nb; ++b) {
++            block_iq1_sx4 out;
++            for (int i = 0; i < 4; ++i) {
++                const block_iq1_s & in = src[(r + i) * nb + b];
++                out.d[i] = in.d;
++                for (int ib = 0; ib < 8; ++ib) {
++                    const uint16_t qh = in.qh[ib];
++                    const int ls = 2 * ((qh >> 12) & 7) + 1;
++                    out.ls_sgn[ib * 4 + i] = (int8_t) ((qh & 0x8000) ? -ls : ls);
++                    const uint16_t idx0 = (uint16_t) (in.qs[ib * 4 + 0] | ((qh << 8) & 0x700));
++                    const uint16_t idx1 = (uint16_t) (in.qs[ib * 4 + 1] | ((qh << 5) & 0x700));
++                    const uint16_t idx2 = (uint16_t) (in.qs[ib * 4 + 2] | ((qh << 2) & 0x700));
++                    const uint16_t idx3 = (uint16_t) (in.qs[ib * 4 + 3] | ((qh >> 1) & 0x700));
++                    const pair_u32 p0 = g_iq1s_lut[idx0];
++                    const pair_u32 p1 = g_iq1s_lut[idx1];
++                    const pair_u32 p2 = g_iq1s_lut[idx2];
++                    const pair_u32 p3 = g_iq1s_lut[idx3];
++                    uint32_t v0 = p0.lo4 | (p0.hi4 << 2) | (p1.lo4 << 4) | (p1.hi4 << 6);
++                    uint32_t v1 = p2.lo4 | (p2.hi4 << 2) | (p3.lo4 << 4) | (p3.hi4 << 6);
++                    memcpy(out.qs + ib * 32 + 0  + i * 4, &v0, 4);
++                    memcpy(out.qs + ib * 32 + 16 + i * 4, &v1, 4);
++                }
++            }
++            *dst++ = out;
++        }
++    }
++}
++
++void ggml_arm_gemv_iq1_s_4x4_q8_K(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    const int nb = n / QK_K;
++    const block_iq1_sx4 * b_ptr = (const block_iq1_sx4 *) vx;
++    const block_q8_K * a_base = (const block_q8_K *) vy;
++    const uint8x16_t m3 = vdupq_n_u8(0x03);
++    for (int c = 0; c < nc; c += 4) {
++        float32x4_t acc = vdupq_n_f32(0.0f);
++        for (int b = 0; b < nb; ++b) {
++            const block_q8_K * ap = &a_base[b];
++            int32x4_t sumi = vdupq_n_s32(0);
++            int32x4_t sumi3 = vdupq_n_s32(0);
++            for (int ib = 0; ib < 8; ++ib) {
++                const int32_t bsum = (int32_t) ap->bsums[2 * ib] + (int32_t) ap->bsums[2 * ib + 1];
++                uint8x16_t b0 = vld1q_u8(b_ptr->qs + ib * 32 + 0);
++                uint8x16_t b1 = vld1q_u8(b_ptr->qs + ib * 32 + 16);
++                int8x16_t a0 = vld1q_s8(ap->qs + ib * 32 + 0);
++                int8x16_t a1 = vld1q_s8(ap->qs + ib * 32 + 16);
++                int32x4_t p = vdupq_n_s32(-bsum);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vandq_u8(b0, m3)),               a0, 0);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b0, 2), m3)), a0, 1);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b0, 4), m3)), a0, 2);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vshrq_n_u8(b0, 6)),               a0, 3);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vandq_u8(b1, m3)),               a1, 0);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b1, 2), m3)), a1, 1);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b1, 4), m3)), a1, 2);
++                p = vdotq_laneq_s32(p, vreinterpretq_s8_u8(vshrq_n_u8(b1, 6)),               a1, 3);
++                int32x4_t ls_s = { b_ptr->ls_sgn[ib*4+0], b_ptr->ls_sgn[ib*4+1], b_ptr->ls_sgn[ib*4+2], b_ptr->ls_sgn[ib*4+3] };
++                int32x4_t ls_u = vabsq_s32(ls_s);
++                sumi  = vmlaq_s32(sumi, p, ls_u);
++                sumi3 = vmlaq_n_s32(sumi3, ls_s, bsum);
++            }
++            float32x4_t d = vmulq_n_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) b_ptr->d)), ap->d);
++            float32x4_t tot = vfmaq_n_f32(vcvtq_f32_s32(sumi), vcvtq_f32_s32(sumi3), IQ1S_DELTA);
++            acc = vfmaq_f32(acc, d, tot);
++            b_ptr++;
++        }
++        vst1q_f32(s + c, acc);
++    }
++}
++
++void ggml_arm_repack_iq2_s_4x4(void * GGML_RESTRICT dst_v, const void * GGML_RESTRICT src_v, int64_t ne0, int64_t ne1) {
++    init_mmid_repack_luts();
++    const int64_t nb = ne0 / QK_K;
++    const block_iq2_s * src = (const block_iq2_s *) src_v;
++    block_iq2_4x4 * dst = (block_iq2_4x4 *) dst_v;
++    for (int64_t r = 0; r < ne1; r += 4) {
++        for (int64_t b = 0; b < nb; ++b) {
++            block_iq2_4x4 out;
++            for (int i = 0; i < 4; ++i) {
++                const block_iq2_s & in = src[(r + i) * nb + b];
++                out.d[i] = in.d;
++                const uint8_t * signs = in.qs + QK_K / 8;
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    out.scales[ib32 * 4 + i] = in.scales[ib32];
++                    const uint8_t qh = in.qh[ib32];
++                    for (int h = 0; h < 2; ++h) {
++                        const int sb = ib32 * 2 + h;
++                        const int k0 = ib32 * 4 + h * 2;
++                        const int idx0 = in.qs[k0 + 0] | ((qh << (8 - 2 * (h * 2 + 0))) & 0x300);
++                        const int idx1 = in.qs[k0 + 1] | ((qh << (8 - 2 * (h * 2 + 1))) & 0x300);
++                        const pair_u32 p0 = g_iq2s_lut[idx0];
++                        const pair_u32 s0 = g_byte_sgn_lut[signs[k0 + 0]];
++                        const pair_u32 p1 = g_iq2s_lut[idx1];
++                        const pair_u32 s1 = g_byte_sgn_lut[signs[k0 + 1]];
++                        uint32_t w0 = (p0.lo4 | s0.lo4) | ((p1.lo4 | s1.lo4) << 4);
++                        uint32_t w1 = (p0.hi4 | s0.hi4) | ((p1.hi4 | s1.hi4) << 4);
++                        memcpy(out.qs + sb * 32 + 0  + i * 4, &w0, 4);
++                        memcpy(out.qs + sb * 32 + 16 + i * 4, &w1, 4);
++                    }
++                }
++            }
++            *dst++ = out;
++        }
++    }
++}
++
++void ggml_arm_repack_iq2_xs_4x4(void * GGML_RESTRICT dst_v, const void * GGML_RESTRICT src_v, int64_t ne0, int64_t ne1) {
++    init_mmid_repack_luts();
++    const int64_t nb = ne0 / QK_K;
++    const block_iq2_xs * src = (const block_iq2_xs *) src_v;
++    block_iq2_4x4 * dst = (block_iq2_4x4 *) dst_v;
++    for (int64_t r = 0; r < ne1; r += 4) {
++        for (int64_t b = 0; b < nb; ++b) {
++            block_iq2_4x4 out;
++            for (int i = 0; i < 4; ++i) {
++                const block_iq2_xs & in = src[(r + i) * nb + b];
++                out.d[i] = in.d;
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    out.scales[ib32 * 4 + i] = in.scales[ib32];
++                    for (int h = 0; h < 2; ++h) {
++                        const int sb = ib32 * 2 + h;
++                        const uint16_t q0 = in.qs[ib32 * 4 + h * 2 + 0];
++                        const uint16_t q1 = in.qs[ib32 * 4 + h * 2 + 1];
++                        const pair_u32 p0 = g_iq2xs_lut[q0 & 511];
++                        const pair_u32 s0 = g_keven_sgn_lut[q0 >> 9];
++                        const pair_u32 p1 = g_iq2xs_lut[q1 & 511];
++                        const pair_u32 s1 = g_keven_sgn_lut[q1 >> 9];
++                        uint32_t w0 = (p0.lo4 | s0.lo4) | ((p1.lo4 | s1.lo4) << 4);
++                        uint32_t w1 = (p0.hi4 | s0.hi4) | ((p1.hi4 | s1.hi4) << 4);
++                        memcpy(out.qs + sb * 32 + 0  + i * 4, &w0, 4);
++                        memcpy(out.qs + sb * 32 + 16 + i * 4, &w1, 4);
++                    }
++                }
++            }
++            *dst++ = out;
++        }
++    }
++}
++
++void ggml_arm_repack_iq2_xxs_4x4(void * GGML_RESTRICT dst_v, const void * GGML_RESTRICT src_v, int64_t ne0, int64_t ne1) {
++    init_mmid_repack_luts();
++    const int64_t nb = ne0 / QK_K;
++    const block_iq2_xxs * src = (const block_iq2_xxs *) src_v;
++    block_iq2_4x4 * dst = (block_iq2_4x4 *) dst_v;
++    for (int64_t r = 0; r < ne1; r += 4) {
++        for (int64_t b = 0; b < nb; ++b) {
++            block_iq2_4x4 out;
++            for (int i = 0; i < 4; ++i) {
++                const block_iq2_xxs & in = src[(r + i) * nb + b];
++                out.d[i] = in.d;
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    uint32_t aux32[2];
++                    memcpy(aux32, in.qs + ib32 * 4, 2 * sizeof(uint32_t));
++                    const uint8_t * aux8 = (const uint8_t *) aux32;
++                    const uint8_t sc = (uint8_t) (aux32[1] >> 28);
++                    out.scales[ib32 * 4 + i] = (uint8_t) (sc | (sc << 4));
++                    for (int h = 0; h < 2; ++h) {
++                        const int sb = ib32 * 2 + h;
++                        const pair_u32 p0 = g_iq2xxs_lut[aux8[h * 2 + 0]];
++                        const pair_u32 s0 = g_keven_sgn_lut[(aux32[1] >> (7 * (h * 2 + 0))) & 127];
++                        const pair_u32 p1 = g_iq2xxs_lut[aux8[h * 2 + 1]];
++                        const pair_u32 s1 = g_keven_sgn_lut[(aux32[1] >> (7 * (h * 2 + 1))) & 127];
++                        uint32_t w0 = (p0.lo4 | s0.lo4) | ((p1.lo4 | s1.lo4) << 4);
++                        uint32_t w1 = (p0.hi4 | s0.hi4) | ((p1.hi4 | s1.hi4) << 4);
++                        memcpy(out.qs + sb * 32 + 0  + i * 4, &w0, 4);
++                        memcpy(out.qs + sb * 32 + 16 + i * 4, &w1, 4);
++                    }
++                }
++            }
++            *dst++ = out;
++        }
++    }
++}
++
++void ggml_arm_gemv_iq2_4x4_q8_K(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    static const int8_t iq2_nib_vals[16] = { 8, 25, 43, 0, -8, -25, -43, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++    const int nb = n / QK_K;
++    const block_iq2_4x4 * b_ptr = (const block_iq2_4x4 *) vx;
++    const block_q8_K * a_base = (const block_q8_K *) vy;
++    const int8x16_t kvals = vld1q_s8(iq2_nib_vals);
++    const uint8x16_t m4b = vdupq_n_u8(0x0f);
++    for (int c = 0; c < nc; c += 4) {
++        float32x4_t acc = vdupq_n_f32(0.0f);
++        for (int b = 0; b < nb; ++b) {
++            const block_q8_K * ap = &a_base[b];
++            int32x4_t sumi = vdupq_n_s32(0);
++            for (int ib32 = 0; ib32 < 8; ++ib32) {
++                const uint8_t * sp = b_ptr->scales + ib32 * 4;
++                int32x4_t sc_lo = { 1 + 2*(sp[0] & 0xf), 1 + 2*(sp[1] & 0xf), 1 + 2*(sp[2] & 0xf), 1 + 2*(sp[3] & 0xf) };
++                int32x4_t sc_hi = { 1 + 2*(sp[0] >>  4), 1 + 2*(sp[1] >>  4), 1 + 2*(sp[2] >>  4), 1 + 2*(sp[3] >>  4) };
++                for (int h = 0; h < 2; ++h) {
++                    const int sb = ib32 * 2 + h;
++                    int8x16_t a_sb = vld1q_s8(ap->qs + sb * 16);
++                    uint8x16_t b0 = vld1q_u8(b_ptr->qs + sb * 32 + 0);
++                    uint8x16_t b1 = vld1q_u8(b_ptr->qs + sb * 32 + 16);
++                    int32x4_t p = vdupq_n_s32(0);
++                    p = vdotq_laneq_s32(p, vqtbl1q_s8(kvals, vandq_u8(b0, m4b)), a_sb, 0);
++                    p = vdotq_laneq_s32(p, vqtbl1q_s8(kvals, vandq_u8(b1, m4b)), a_sb, 1);
++                    p = vdotq_laneq_s32(p, vqtbl1q_s8(kvals, vshrq_n_u8(b0, 4)), a_sb, 2);
++                    p = vdotq_laneq_s32(p, vqtbl1q_s8(kvals, vshrq_n_u8(b1, 4)), a_sb, 3);
++                    sumi = vmlaq_s32(sumi, p, h == 0 ? sc_lo : sc_hi);
++                }
++            }
++            float32x4_t d = vmulq_n_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) b_ptr->d)), ap->d);
++            acc = vfmaq_f32(acc, d, vcvtq_f32_s32(sumi));
++            b_ptr++;
++        }
++        vst1q_f32(s + c, vmulq_n_f32(acc, 0.125f));
++    }
++}
++
++} // extern "C"
++#else
++extern "C" {
++bool ggml_arm_mmid_has_custom_kernels(void) { return false; }
++void ggml_arm_repack_q2_0_4x4(void *, const void *, int64_t, int64_t) {}
++void ggml_arm_repack_nvfp4_4x4(void *, const void *, int64_t, int64_t) {}
++void ggml_arm_repack_q2_K_4x4(void *, const void *, int64_t, int64_t) {}
++void ggml_arm_repack_iq1_s_4x4(void *, const void *, int64_t, int64_t) {}
++void ggml_arm_repack_iq2_s_4x4(void *, const void *, int64_t, int64_t) {}
++void ggml_arm_repack_iq2_xs_4x4(void *, const void *, int64_t, int64_t) {}
++void ggml_arm_repack_iq2_xxs_4x4(void *, const void *, int64_t, int64_t) {}
++void ggml_arm_gemv_q2_0_4x4_q8_0(int, float *, const void *, const void *, int) {}
++void ggml_arm_gemv_nvfp4_4x4_q8_0(int, float *, const void *, const void *, int) {}
++void ggml_arm_gemv_mxfp4_4x4_q8_0_exact(int, float *, const void *, const void *, int) {}
++void ggml_arm_gemv_q2_K_4x4_q8_K(int, float *, const void *, const void *, int) {}
++void ggml_arm_gemv_iq1_s_4x4_q8_K(int, float *, const void *, const void *, int) {}
++void ggml_arm_gemv_iq2_4x4_q8_K(int, float *, const void *, const void *, int) {}
++} // extern "C"
++#endif
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-impl.h b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+index f8b3637..4cf1246 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-impl.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+@@ -534,6 +534,22 @@ void ggml_barrier(struct ggml_threadpool * tp);
+ 
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
+ int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
++// sage-lab thread scaling (runs/speed/THREAD_SCALING.md): env GGML_CPU_FINE_CHUNKS=1, read once
++bool ggml_cpu_fine_chunks(void);
++// GGML_CPU_EMU_SLOW measurement aid: returns 0 unless this thread is an emulated slow one
++int64_t ggml_cpu_emu_now(const struct ggml_compute_params * params);
++void    ggml_cpu_emu_stretch(int64_t t0);
++// sage-lab mmid cache repack (GGML_MMID_REPACK=1 same-size, =2 + IQ1_S/IQ2_* unpack)
++size_t  ggml_mmid_repack_info(enum ggml_type type, int64_t ne0, int64_t ne1, int mode, int * out_nb_cols);
++void    ggml_mmid_repack_slice(enum ggml_type type, int64_t ne0, int64_t ne1, void * dst, const void * src, size_t src_size);
++void    ggml_mmid_repack_gemv(enum ggml_type type, int64_t ne0, int64_t ne1,
++                              const void * repacked_slice, int64_t ir0_start, int64_t ir0_end,
++                              const void * src1_col, float * dst_col);
++const struct ggml_cpu_lm_head_ops * ggml_cpu_lm_head_get_ops(void);
++// sage-lab CECAR decoupled cache-bonus routing (env GGML_MMID_CECAR_BONUS, default 0)
++float ggml_cpu_mmid_cecar_bonus(void);
++bool  ggml_cpu_mmid_is_cached(const char * base, size_t nb2, int expert);
++void  ggml_cpu_mmid_cecar_note(int n_swaps);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 33193a5..0d567a2 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -15,6 +15,9 @@
+ #include "ggml.h"
+ #include "common.h"
+ #include "tiled/tiled.h"
++#if defined(__APPLE__)
++#include <dispatch/dispatch.h>
++#endif
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+@@ -582,7 +585,7 @@ struct ggml_state {
+ 
+ static struct ggml_state g_state = {0};
+ 
+-void ggml_barrier(struct ggml_threadpool * tp) {
++static void ggml_barrier_impl(struct ggml_threadpool * tp) {
+     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+     if (n_threads == 1) {
+         return;
+@@ -620,6 +623,116 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+ #endif
+ }
+ 
++static int ggml_cpu_emu_k = -1, ggml_cpu_emu_f = 3;
++static _Thread_local int64_t ggml_cpu_emu_bar_ns = 0; // barrier wait of this thread, left out of the emulated stretch
++
++static int64_t ggml_cpu_now_ns(void) {
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t) ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++void ggml_barrier(struct ggml_threadpool * tp) {
++    if (ggml_cpu_emu_k > 0) {
++        const int64_t t0 = ggml_cpu_now_ns();
++        ggml_barrier_impl(tp);
++        ggml_cpu_emu_bar_ns += ggml_cpu_now_ns() - t0;
++        return;
++    }
++    ggml_barrier_impl(tp);
++}
++
++// Thread scaling switches (sage-lab, runs/speed/THREAD_SCALING.md). All off by default, each read once.
++//   GGML_CPU_FINE_CHUNKS=1  matmuls never fall back to one static slice per thread; rows go out in small chunks that
++//                           threads take dynamically, so a slow core never holds a whole slice (lossless: rows are
++//                           only regrouped, each row is still one full dot product)
++//   GGML_CPU_QOS=<class>    put every compute thread at this QoS (Apple only): user_interactive|user_initiated|default|utility
++//   GGML_CPU_EMU_SLOW=<k>   measurement aid, not a fix: the last k threads of a graph (never thread 0) busy-wait
++//   GGML_CPU_EMU_FACTOR=<f> (f-1) x the time of each piece of work they do (default f=3), so they run f times slower,
++//                           like the phone's efficiency cores. Matmuls stretch each chunk, other ops the whole node;
++//                           time spent in ggml_barrier inside a node is not stretched
++//   GGML_CPU_SMALL_NODE=<n> elementwise and row ops with at most n output elements run on threads 0..k-1 only
++//   GGML_CPU_SMALL_THREADS=<k> (default 1, nth=k); the others go straight to the node barrier, so a slow core does not
++//                           gate a tiny node if threads 0..k-1 are the fast ones (lossless: same result for any split)
++static int ggml_cpu_env_int(const char * name) { const char * v = getenv(name); return v ? atoi(v) : 0; }
++
++bool ggml_cpu_fine_chunks(void) {
++    static int state = -1;
++    if (state < 0) { state = ggml_cpu_env_int("GGML_CPU_FINE_CHUNKS") == 1; }
++    return state == 1;
++}
++
++static void ggml_cpu_emu_init(void) {
++    if (ggml_cpu_emu_k >= 0) { return; }
++    const int f = ggml_cpu_env_int("GGML_CPU_EMU_FACTOR");
++    if (f > 1) { ggml_cpu_emu_f = f; }
++    ggml_cpu_emu_k = ggml_cpu_env_int("GGML_CPU_EMU_SLOW");
++}
++
++// work clock of an emulated slow thread (wall time minus its barrier waits); 0 on every other thread
++int64_t ggml_cpu_emu_now(const struct ggml_compute_params * params) {
++    if (ggml_cpu_emu_k <= 0 || params->ith == 0 || params->ith < params->nth - ggml_cpu_emu_k) { return 0; }
++    return ggml_cpu_now_ns() - ggml_cpu_emu_bar_ns;
++}
++
++void ggml_cpu_emu_stretch(int64_t t0) {
++    if (t0 == 0) { return; }
++    const int64_t work = ggml_cpu_now_ns() - ggml_cpu_emu_bar_ns - t0;
++    const int64_t until = ggml_cpu_now_ns() + work * (ggml_cpu_emu_f - 1);
++    while (ggml_cpu_now_ns() < until) { }
++}
++
++static int ggml_cpu_small_node_max(void) {
++    static int v = -1;
++    if (v < 0) { v = ggml_cpu_env_int("GGML_CPU_SMALL_NODE"); if (v < 0) { v = 0; } }
++    return v;
++}
++
++static int ggml_cpu_small_threads(void) {
++    static int v = -1;
++    if (v < 0) { v = ggml_cpu_env_int("GGML_CPU_SMALL_THREADS"); if (v < 1) { v = 1; } }
++    return v;
++}
++
++// ops whose result does not depend on how rows are split and that never call ggml_barrier
++static bool ggml_cpu_node_is_small(const struct ggml_tensor * node, int max_elems) {
++    if (ggml_nelements(node) > max_elems) { return false; }
++    switch (node->op) {
++        case GGML_OP_ADD: case GGML_OP_SUB: case GGML_OP_MUL: case GGML_OP_DIV: case GGML_OP_SCALE:
++        case GGML_OP_SQR: case GGML_OP_SQRT: case GGML_OP_CLAMP: case GGML_OP_UNARY: case GGML_OP_GLU:
++        case GGML_OP_CONT: case GGML_OP_CPY: case GGML_OP_DUP: case GGML_OP_CONCAT: case GGML_OP_REPEAT:
++        case GGML_OP_PAD: case GGML_OP_FILL: case GGML_OP_GET_ROWS: case GGML_OP_SET_ROWS:
++        case GGML_OP_SOFT_MAX: case GGML_OP_ARGSORT: case GGML_OP_SUM_ROWS: case GGML_OP_SSM_CONV:
++            return true;
++        default:
++            return false;
++    }
++}
++
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++static qos_class_t ggml_cpu_qos_from_env(void) {
++    const char * v = getenv("GGML_CPU_QOS");
++    if (!v) { return QOS_CLASS_UNSPECIFIED; }
++    if (strcmp(v, "user_interactive") == 0) { return QOS_CLASS_USER_INTERACTIVE; }
++    if (strcmp(v, "user_initiated") == 0)   { return QOS_CLASS_USER_INITIATED; }
++    if (strcmp(v, "default") == 0)          { return QOS_CLASS_DEFAULT; }
++    if (strcmp(v, "utility") == 0)          { return QOS_CLASS_UTILITY; }
++    return QOS_CLASS_UNSPECIFIED;
++}
++
++// called by each compute thread before it computes a graph
++static void ggml_cpu_apply_thread_qos(void) {
++    static qos_class_t qos = QOS_CLASS_UNSPECIFIED;
++    static bool qos_read = false;
++    if (!qos_read) { qos = ggml_cpu_qos_from_env(); qos_read = true; }
++    static _Thread_local bool applied = false;
++    if (qos == QOS_CLASS_UNSPECIFIED || applied) { return; }
++    applied = pthread_set_qos_class_self_np(qos, 0) == 0;
++}
++#else
++static void ggml_cpu_apply_thread_qos(void) { }
++#endif
++
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
+     atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
+ }
+@@ -1468,7 +1581,14 @@ UseGgmlGemm2:;
+     // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
+     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
+     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
+-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
++    if (ggml_cpu_fine_chunks() && nth > 1 && nchunk0 * nchunk1 < nth * 4 && !ggml_is_numa()) {
++        // GGML_CPU_FINE_CHUNKS: about 8 chunks per thread along the longer side (even rows kept for mmla kernels)
++        const int64_t nr = nr0 > nr1 ? nr0 : nr1;
++        int64_t rows = (nr + nth * 8 - 1) / (nth * 8);
++        rows = MAX(rows + (rows & 1), 2);
++        nchunk0 = nr0 > nr1 ? (nr0 + rows - 1) / rows : 1;
++        nchunk1 = nr0 > nr1 ? 1 : (nr1 + rows - 1) / rows;
++    } else if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+         // distribute the thread work across the inner or outer loop based on which one is larger
+         nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+         nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+@@ -1499,7 +1619,9 @@ UseGgmlGemm2:;
+         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
+             num_rows_per_vec_dot = 1;
+         }
++        const int64_t emu_t0 = ggml_cpu_emu_now(params);
+         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
++        ggml_cpu_emu_stretch(emu_t0);
+ 
+         if (nth >= nchunk0 * nchunk1) {
+             break;
+@@ -1509,6 +1631,782 @@ UseGgmlGemm2:;
+     }
+ }
+ 
++// Expert cache (sage-lab, inkling-phone): env GGML_MMID_CACHE_MB > 0 keeps the expert slices used by mul_mat_id
++// in anonymous memory (LRU, byte budget), so a memory-mapped expert tensor is read from the file once per miss
++// instead of depending on the OS page cache. Filled by thread 0 before the barrier; ops run one at a time.
++#define MMID_CACHE_SLOTS 16384
++struct mmid_task;
++struct mmid_cache_entry {
++    const char * key; char * buf; size_t size; uint64_t tick;
++    // Atomic Engine port (below); unused while every GGML_MMID_* switch is off
++    struct mmid_cache_entry * older, * newer; // LRU list links
++    struct mmid_task * task;                  // queued read, guarded by mmid_io.mu
++    atomic_int state;                         // MMID_LOADING -> MMID_READY
++    int  pins, list, sz, tensor, expert;
++    bool linked, prefetched, pf_issued;       // prefetched: holds a read-ahead pin for the down op
++    // GGML_MMID_REPACK: file_size (bytes on disk) vs size (cached bytes); repacked layout metadata
++    size_t file_size;
++    int64_t ne0, ne1;
++    enum ggml_type src_type;
++    bool repacked;
++};
++static struct mmid_cache_entry mmid_cache[MMID_CACHE_SLOTS];
++static size_t   mmid_cache_bytes = 0, mmid_cache_budget = 0;
++static uint64_t mmid_cache_tick = 0, mmid_cache_hits = 0, mmid_cache_misses = 0, mmid_cache_miss_bytes = 0;
++static int      mmid_cache_state = -1; // -1 unknown, 0 off, 1 on
++static const char * mmid_cache_ptr[1024]; // per expert of the current op
++static bool         mmid_cache_repacked[1024];
++
++GGML_BACKEND_API void ggml_cpu_mmid_cache_stats(uint64_t * hits, uint64_t * misses, uint64_t * miss_bytes, uint64_t * bytes);
++void ggml_cpu_mmid_cache_stats(uint64_t * hits, uint64_t * misses, uint64_t * miss_bytes, uint64_t * bytes) {
++    *hits = mmid_cache_hits; *misses = mmid_cache_misses; *miss_bytes = mmid_cache_miss_bytes; *bytes = mmid_cache_bytes;
++}
++
++static void mmid_port_init(void);
++static int  mmid_stats_on = 0, mmid_repack_mode = 0;
++static float mmid_cecar_bonus_val = 0.0f;
++static int   mmid_cecar_inited = 0;
++static atomic_ullong mmid_read_bytes, mmid_read_calls, mmid_repacked_slices, mmid_repack_us;
++static atomic_ullong mmid_cecar_calls, mmid_cecar_swaps;
++static uint64_t mmid_wait_us = 0;
++
++float ggml_cpu_mmid_cecar_bonus(void) {
++    if (!mmid_cecar_inited) {
++        const char * env = getenv("GGML_MMID_CECAR_BONUS");
++        mmid_cecar_bonus_val = env ? (float) atof(env) : 0.0f;
++        mmid_cecar_inited = 1;
++    }
++    return mmid_cecar_bonus_val;
++}
++
++bool ggml_cpu_mmid_is_cached(const char * base, size_t nb2, int expert) {
++    if (mmid_cache_state != 1 || !base) { return false; }
++    const char * key = base + (size_t) expert * nb2;
++    size_t i = ((uintptr_t) key >> 6) % MMID_CACHE_SLOTS;
++    while (mmid_cache[i].key && mmid_cache[i].key != key) { i = (i + 1) % MMID_CACHE_SLOTS; }
++    return mmid_cache[i].key == key && mmid_cache[i].buf != NULL;
++}
++
++void ggml_cpu_mmid_cecar_note(int n_swaps) {
++    atomic_fetch_add(&mmid_cecar_calls, 1);
++    if (n_swaps > 0) { atomic_fetch_add(&mmid_cecar_swaps, (unsigned long long) n_swaps); }
++}
++
++static void mmid_cache_init(void) {
++    const char * env = getenv("GGML_MMID_CACHE_MB");
++    mmid_cache_budget = env ? (size_t) atoll(env) * 1024 * 1024 : 0;
++    const char * renv = getenv("GGML_MMID_REPACK");
++    mmid_repack_mode = renv ? atoi(renv) : 0;
++    if (mmid_repack_mode < 0 || mmid_repack_mode > 2) { mmid_repack_mode = 0; }
++    if (mmid_cache_budget > 0) { mmid_port_init(); }
++    mmid_cache_state = mmid_cache_budget > 0;
++}
++
++static bool mmid_cache_on(void) {
++#if defined(__APPLE__) || defined(__linux__)
++    // every compute thread asks before the op barrier: initialise (env, reader threads, atexit) exactly once, and
++    // pthread_once also orders the settings it wrote before every caller's reads
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, mmid_cache_init);
++#else
++    if (mmid_cache_state < 0) { mmid_cache_init(); }
++#endif
++    return mmid_cache_state == 1;
++}
++
++// misses of the current op, filled together after the lookups
++static struct mmid_cache_entry * mmid_pending[1024];
++static int mmid_n_pending = 0;
++
++static const char * mmid_cache_get(const char * key, size_t file_size, enum ggml_type type, int64_t ne0, int64_t ne1, bool * out_repacked) {
++    size_t i = ((uintptr_t) key >> 6) % MMID_CACHE_SLOTS;
++    while (mmid_cache[i].key && mmid_cache[i].key != key) { i = (i + 1) % MMID_CACHE_SLOTS; }
++    struct mmid_cache_entry * e = &mmid_cache[i];
++    e->tick = ++mmid_cache_tick;
++    if (e->buf) { mmid_cache_hits++; *out_repacked = e->repacked; return e->buf; }
++    const size_t rep_size = mmid_repack_mode ? ggml_mmid_repack_info(type, ne0, ne1, mmid_repack_mode, NULL) : 0;
++    const bool do_repack = rep_size > 0;
++    const size_t size = do_repack ? rep_size : file_size;
++    mmid_cache_misses++; mmid_cache_miss_bytes += file_size;
++    char * buf = NULL;
++    while (mmid_cache_bytes + size > mmid_cache_budget) {
++        // evict the least recently used slice (never one used by the current op); reuse its buffer when the size matches
++        struct mmid_cache_entry * old = NULL;
++        for (size_t j = 0; j < MMID_CACHE_SLOTS; j++) {
++            if (mmid_cache[j].buf && mmid_cache[j].tick + 1024 < mmid_cache_tick && (!old || mmid_cache[j].tick < old->tick)) { old = &mmid_cache[j]; }
++        }
++        if (!old) { break; }
++        mmid_cache_bytes -= old->size;
++        if (old->size == size && !buf) { buf = old->buf; } else { free(old->buf); }
++        old->buf = NULL;
++    }
++    if (!buf && posix_memalign((void **) &buf, 16384, size) != 0) { *out_repacked = false; return key; }
++    e->key = key; e->buf = buf; e->size = size;
++    e->file_size = file_size; e->ne0 = ne0; e->ne1 = ne1; e->src_type = type; e->repacked = do_repack;
++    mmid_cache_bytes += size;
++    mmid_pending[mmid_n_pending++] = e;
++    *out_repacked = do_repack;
++    return buf;
++}
++
++static void mmid_repack_from_raw(struct mmid_cache_entry * e, const char * raw) {
++    const int64_t t0 = mmid_stats_on ? ggml_time_us() : 0;
++    ggml_mmid_repack_slice(e->src_type, e->ne0, e->ne1, e->buf, raw, e->file_size);
++    if (mmid_stats_on) {
++        atomic_fetch_add(&mmid_repacked_slices, 1);
++        atomic_fetch_add(&mmid_repack_us, (unsigned long long) (ggml_time_us() - t0));
++    }
++}
++
++static void mmid_read_one_with_scratch(struct mmid_cache_entry * e, char ** scratch, size_t * scratch_cap) {
++    if (!e->repacked) {
++        if (!ggml_file_map_read(e->key, e->buf, e->file_size)) { memcpy(e->buf, e->key, e->file_size); }
++        if (mmid_stats_on) { atomic_fetch_add(&mmid_read_calls, 1); atomic_fetch_add(&mmid_read_bytes, e->file_size); }
++        return;
++    }
++    char * raw = NULL;
++    bool own_raw = false;
++    if (scratch && scratch_cap) {
++        if (*scratch_cap < e->file_size) {
++            char * nb = (char *) realloc(*scratch, e->file_size);
++            GGML_ASSERT(nb != NULL);
++            *scratch = nb;
++            *scratch_cap = e->file_size;
++        }
++        raw = *scratch;
++    } else {
++        raw = (char *) malloc(e->file_size);
++        GGML_ASSERT(raw != NULL);
++        own_raw = true;
++    }
++    if (!ggml_file_map_read(e->key, raw, e->file_size)) { memcpy(raw, e->key, e->file_size); }
++    if (mmid_stats_on) { atomic_fetch_add(&mmid_read_calls, 1); atomic_fetch_add(&mmid_read_bytes, e->file_size); }
++    mmid_repack_from_raw(e, raw);
++    if (own_raw) { free(raw); }
++}
++
++static void mmid_cache_fill_one(void * ctx, size_t i) {
++    (void) ctx;
++    mmid_read_one_with_scratch(mmid_pending[i], NULL, NULL);
++}
++
++static void mmid_cache_fill(void) {
++#if defined(__APPLE__)
++    if (mmid_n_pending > 1) {
++        dispatch_apply_f((size_t) mmid_n_pending, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), NULL, mmid_cache_fill_one);
++        mmid_n_pending = 0;
++        return;
++    }
++#endif
++    for (int i = 0; i < mmid_n_pending; i++) { mmid_cache_fill_one(NULL, (size_t) i); }
++    mmid_n_pending = 0;
++}
++
++// Atomic Engine port (sage-lab, 2026-11-24; Atomic Engine is MIT). Each part is off by default, read once at init:
++//   GGML_MMID_OVERLAP=1   known-route overlap: the op's misses go to an urgent queue and the paired down slices to a low queue
++//                         of 2 reader threads; compute runs the resident experts first and waits only for its own misses
++//   GGML_MMID_LRU=1       O(1) LRU, one list per slice size so a victim's buffer is reused in place;  =2 ClassLRU
++//   GGML_MMID_COALESCE=1  one preadv for file-adjacent missing slices; in prefill ubatches of >= 512 tokens the slices not
++//                         used by the last row are read into a scratch buffer instead of the cache
++//   GGML_MMID_STATS=1     counters printed once at exit
++// Locking. The cache table, LRU lists, pins, history and scratch buffers are changed only by compute thread 0 in the
++// mul_mat_id prologue, while the other compute threads wait at the op barrier. An entry that is pinned or LOADING is never
++// evicted or reused. Reader threads touch only the entries of their own task: key, buf and size read-only, state written.
++// mmid_io.mu guards the queues, entry->task and the LOADING -> READY change (release store, broadcast on mmid_io.done);
++// compute threads load entry->state with acquire and sleep on mmid_io.done until READY. The pins of an op are dropped by
++// thread 0 at the next mul_mat_id, past the node barrier, when no compute thread still reads those buffers.
++#if defined(__APPLE__) || defined(__linux__)
++#define MMID_PORT 1
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#endif
++
++enum { MMID_EMPTY = 0, MMID_LOADING = 1, MMID_READY = 2 };
++#define MMID_GROUP_MAX  16   // Atomic Engine: <= 16 slices per batched read
++#define MMID_IO_THREADS 2   // reader threads; GGML_MMID_IO_THREADS=<1..8> overrides (THREAD_SCALING.md)
++#define MMID_IO_THREADS_MAX 8
++#define MMID_TASKS      1024
++#define MMID_LISTS      16   // LRU: one list per slice size; ClassLRU: 8 classes
++#define MMID_CLASSES    8
++#define MMID_TENSORS    128
++#define MMID_ALIGN      16384
++#define MMID_BYPASS_MIN_TOKENS 512
++
++static int mmid_overlap = 0, mmid_lru = 0, mmid_coalesce = 0;
++static uint64_t mmid_pf_issued = 0, mmid_pf_used = 0, mmid_pf_wasted = 0, mmid_bypass_reads = 0;
++
++static bool mmid_port_active(void) { return mmid_overlap || mmid_lru || mmid_coalesce; }
++
++// ---- reader threads: urgent and low queues, adapted from Atomic Engine src/llama-expert-read-pool.h (early_io::pool)
++struct mmid_task { struct mmid_task * next; struct mmid_cache_entry * e[MMID_GROUP_MAX]; int n; bool urgent, queued; };
++static struct {
++    pthread_mutex_t mu; pthread_cond_t work, done;
++    pthread_t threads[MMID_IO_THREADS_MAX]; int n_threads; bool stop;
++    struct mmid_task * high, * high_tail, * low, * low_tail, * free_list;
++    struct mmid_task tasks[MMID_TASKS];
++} mmid_io = { .mu = PTHREAD_MUTEX_INITIALIZER, .work = PTHREAD_COND_INITIALIZER, .done = PTHREAD_COND_INITIALIZER };
++
++static void mmid_append(struct mmid_task ** head, struct mmid_task ** tail, struct mmid_task * t) {
++    t->next = NULL; if (*tail) { (*tail)->next = t; } else { *head = t; } *tail = t;
++}
++static struct mmid_task * mmid_pop(struct mmid_task ** head, struct mmid_task ** tail) {
++    struct mmid_task * t = *head; *head = t->next; if (!*head) { *tail = NULL; } t->next = NULL; return t;
++}
++static void mmid_unlink(struct mmid_task ** head, struct mmid_task ** tail, struct mmid_task * t) {
++    struct mmid_task * prev = NULL;
++    for (struct mmid_task * p = *head; p; prev = p, p = p->next) {
++        if (p == t) { if (prev) { prev->next = p->next; } else { *head = p->next; } if (*tail == p) { *tail = prev; } p->next = NULL; return; }
++    }
++}
++
++// read a group of file-adjacent slices with one preadv (Atomic Engine src/llama-expert-source.cpp, adjacent layout)
++static void mmid_read_group(struct mmid_cache_entry * const * es, int n, char ** scratch, size_t * scratch_cap) {
++    size_t total = 0;
++    if (n > 1) {
++        void * dst[MMID_GROUP_MAX]; size_t size[MMID_GROUP_MAX];
++        for (int i = 0; i < n; i++) { dst[i] = es[i]->buf; size[i] = es[i]->file_size; total += size[i]; }
++        if (ggml_file_map_readv(es[0]->key, dst, size, n)) {
++            if (mmid_stats_on) { atomic_fetch_add(&mmid_read_calls, 1); atomic_fetch_add(&mmid_read_bytes, total); }
++            for (int i = 0; i < n; i++) {
++                if (!es[i]->repacked) { continue; }
++                char * raw = NULL;
++                bool own_raw = false;
++                if (scratch && scratch_cap) {
++                    if (*scratch_cap < es[i]->file_size) {
++                        char * nb = (char *) realloc(*scratch, es[i]->file_size);
++                        GGML_ASSERT(nb != NULL);
++                        *scratch = nb; *scratch_cap = es[i]->file_size;
++                    }
++                    raw = *scratch;
++                } else {
++                    raw = (char *) malloc(es[i]->file_size);
++                    GGML_ASSERT(raw != NULL);
++                    own_raw = true;
++                }
++                memcpy(raw, es[i]->buf, es[i]->file_size);
++                mmid_repack_from_raw(es[i], raw);
++                if (own_raw) { free(raw); }
++            }
++            return;
++        }
++    }
++    for (int i = 0; i < n; i++) {
++        mmid_read_one_with_scratch(es[i], scratch, scratch_cap);
++    }
++}
++
++static void * mmid_io_main(void * arg) {
++    (void) arg;
++#if defined(__APPLE__)
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
++#endif
++    char * scratch = NULL;
++    size_t scratch_cap = 0;
++    pthread_mutex_lock(&mmid_io.mu);
++    for (;;) {
++        while (!mmid_io.stop && !mmid_io.high && !mmid_io.low) { pthread_cond_wait(&mmid_io.work, &mmid_io.mu); }
++        if (mmid_io.stop) { break; } // at exit no op waits: queued reads are dropped
++        struct mmid_task * t = mmid_io.high ? mmid_pop(&mmid_io.high, &mmid_io.high_tail) : mmid_pop(&mmid_io.low, &mmid_io.low_tail);
++        t->queued = false;
++        pthread_mutex_unlock(&mmid_io.mu);
++        mmid_read_group(t->e, t->n, &scratch, &scratch_cap);
++        pthread_mutex_lock(&mmid_io.mu);
++        for (int i = 0; i < t->n; i++) {
++            t->e[i]->task = NULL;
++            atomic_store_explicit(&t->e[i]->state, MMID_READY, memory_order_release);
++        }
++        t->next = mmid_io.free_list; mmid_io.free_list = t;
++        pthread_cond_broadcast(&mmid_io.done);
++    }
++    pthread_mutex_unlock(&mmid_io.mu);
++    free(scratch);
++    return NULL;
++}
++
++// queue one group (the caller set its entries LOADING); without a free task it is read here
++static void mmid_submit(struct mmid_cache_entry * const * es, int n, bool urgent) {
++    pthread_mutex_lock(&mmid_io.mu);
++    struct mmid_task * t = mmid_io.free_list;
++    if (t) {
++        mmid_io.free_list = t->next;
++        for (int i = 0; i < n; i++) { t->e[i] = es[i]; es[i]->task = t; }
++        t->n = n; t->urgent = urgent; t->queued = true;
++        if (urgent) { mmid_append(&mmid_io.high, &mmid_io.high_tail, t); } else { mmid_append(&mmid_io.low, &mmid_io.low_tail, t); }
++        pthread_cond_broadcast(&mmid_io.work);
++    }
++    pthread_mutex_unlock(&mmid_io.mu);
++    if (!t) {
++        mmid_read_group(es, n, NULL, NULL);
++        for (int i = 0; i < n; i++) { atomic_store_explicit(&es[i]->state, MMID_READY, memory_order_release); }
++    }
++}
++
++// an op needs a slice still in the low queue: move it to the urgent queue (early_io::pool::promote)
++static void mmid_promote(struct mmid_cache_entry * e) {
++    pthread_mutex_lock(&mmid_io.mu);
++    struct mmid_task * t = e->task;
++    if (t && t->queued && !t->urgent) {
++        mmid_unlink(&mmid_io.low, &mmid_io.low_tail, t);
++        t->urgent = true;
++        mmid_append(&mmid_io.high, &mmid_io.high_tail, t);
++        pthread_cond_broadcast(&mmid_io.work);
++    }
++    pthread_mutex_unlock(&mmid_io.mu);
++}
++
++static void mmid_wait(struct mmid_cache_entry * e, int ith) {
++    if (atomic_load_explicit(&e->state, memory_order_acquire) != MMID_LOADING) { return; }
++    const int64_t t0 = ith == 0 ? ggml_time_us() : 0;
++    pthread_mutex_lock(&mmid_io.mu);
++    while (atomic_load_explicit(&e->state, memory_order_acquire) == MMID_LOADING) { pthread_cond_wait(&mmid_io.done, &mmid_io.mu); }
++    pthread_mutex_unlock(&mmid_io.mu);
++    if (ith == 0) { mmid_wait_us += ggml_time_us() - t0; }
++}
++
++// split pending slices into groups of file-adjacent ones (COALESCE) and read them: queued (OVERLAP) or now, as the
++// default path does (parallel dispatch over the groups)
++static struct mmid_cache_entry ** mmid_fill_list;
++static int mmid_fill_start[1024 + 1], mmid_fill_groups = 0;
++
++static void mmid_fill_group(void * ctx, size_t g) {
++    (void) ctx;
++    mmid_read_group(mmid_fill_list + mmid_fill_start[g], mmid_fill_start[g + 1] - mmid_fill_start[g], NULL, NULL);
++}
++
++static void mmid_issue(struct mmid_cache_entry ** es, int n, bool urgent) {
++    int groups = 0;
++    for (int i = 0; i < n;) {
++        int j = i + 1;
++        while (mmid_coalesce && j < n && j - i < MMID_GROUP_MAX && es[j]->key == es[j - 1]->key + es[j - 1]->file_size) { j++; }
++        mmid_fill_start[groups++] = i;
++        if (mmid_overlap) { mmid_submit(es + i, j - i, urgent); }
++        i = j;
++    }
++    if (mmid_overlap || groups == 0) { return; }
++    mmid_fill_start[groups] = n;
++    mmid_fill_list = es; mmid_fill_groups = groups;
++    const int64_t t0 = mmid_stats_on ? ggml_time_us() : 0;
++#if defined(__APPLE__)
++    if (groups > 1) {
++        dispatch_apply_f((size_t) groups, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), NULL, mmid_fill_group);
++    } else
++#endif
++    for (int g = 0; g < groups; g++) { mmid_fill_group(NULL, (size_t) g); }
++    if (mmid_stats_on) { mmid_wait_us += ggml_time_us() - t0; }
++    for (int i = 0; i < n; i++) { atomic_store_explicit(&es[i]->state, MMID_READY, memory_order_relaxed); }
++}
++
++// ---- eviction: O(1) LRU / ClassLRU, adapted from Atomic Engine src/llama-expert-store.cpp
++static struct mmid_cache_entry * mmid_lru_first[MMID_LISTS], * mmid_lru_last[MMID_LISTS];
++static size_t mmid_sizes[MMID_LISTS];
++static int    mmid_n_sizes = 0;
++
++static int mmid_size_class(size_t size) {
++    for (int i = 0; i < mmid_n_sizes; i++) { if (mmid_sizes[i] == size) { return i; } }
++    if (mmid_n_sizes == MMID_LISTS) { return MMID_LISTS - 1; } // more sizes than lists: share the last (buffers then reallocate)
++    mmid_sizes[mmid_n_sizes] = size;
++    return mmid_n_sizes++;
++}
++
++static void mmid_unlink_lru(struct mmid_cache_entry * e) {
++    if (!e->linked) { return; }
++    if (e->older) { e->older->newer = e->newer; } else { mmid_lru_first[e->list] = e->newer; }
++    if (e->newer) { e->newer->older = e->older; } else { mmid_lru_last[e->list] = e->older; }
++    e->older = e->newer = NULL; e->linked = false;
++}
++
++static void mmid_append_lru(struct mmid_cache_entry * e) {
++    e->older = mmid_lru_last[e->list]; e->newer = NULL;
++    if (e->older) { e->older->newer = e; } else { mmid_lru_first[e->list] = e; }
++    mmid_lru_last[e->list] = e; e->linked = true;
++}
++
++// ClassLRU history per (tensor, expert); a tensor's clock counts the tokens of its earlier projections
++static struct { const char * base; uint64_t clock; float * crf; uint64_t * last; int n; } mmid_tensors[MMID_TENSORS];
++static int      mmid_n_tensors = 0, mmid_active_tensor = -1;
++static uint64_t mmid_active_tokens = 0;
++
++static int mmid_tensor_id(const char * base, int n_as) {
++    for (int i = 0; i < mmid_n_tensors; i++) { if (mmid_tensors[i].base == base) { return i; } }
++    if (mmid_n_tensors == MMID_TENSORS) { return -1; }
++    float * crf = calloc((size_t) n_as, sizeof(float)); uint64_t * last = calloc((size_t) n_as, sizeof(uint64_t));
++    if (!crf || !last) { free(crf); free(last); return -1; }
++    mmid_tensors[mmid_n_tensors].base = base; mmid_tensors[mmid_n_tensors].crf = crf;
++    mmid_tensors[mmid_n_tensors].last = last; mmid_tensors[mmid_n_tensors].n = n_as;
++    return mmid_n_tensors++;
++}
++
++// Atomic Engine llama_expert_store::begin_projection: advance the previous projection's clock by its tokens
++static void mmid_begin_projection(int t, uint64_t tokens) {
++    if (t < 0 || t == mmid_active_tensor) { return; } // a down op whose read-ahead already began it
++    if (mmid_active_tensor >= 0) { mmid_tensors[mmid_active_tensor].clock += mmid_active_tokens; }
++    mmid_active_tensor = t; mmid_active_tokens = tokens;
++}
++
++// Atomic Engine impl::touch: eight classes, 128-token half-life, history kept after eviction
++static int mmid_touch(int t, int expert) {
++    if (t < 0) { return 0; }
++    const uint64_t now = mmid_tensors[t].clock;
++    float * crf = &mmid_tensors[t].crf[expert];
++    *crf = *crf * exp2f(-(float) (now - mmid_tensors[t].last[expert]) / 128.0f) + 1.0f;
++    mmid_tensors[t].last[expert] = now;
++    const int cls = (int) log2f(*crf);
++    return cls < 0 ? 0 : (cls > MMID_CLASSES - 1 ? MMID_CLASSES - 1 : cls);
++}
++
++static bool mmid_evictable(const struct mmid_cache_entry * e) {
++    return e->buf && e->pins == 0 && atomic_load_explicit(&e->state, memory_order_acquire) != MMID_LOADING;
++}
++
++static struct mmid_cache_entry * mmid_oldest_unpinned(int list) {
++    struct mmid_cache_entry * c = mmid_lru_first[list];
++    while (c && !mmid_evictable(c)) { c = c->newer; }
++    return c;
++}
++
++static struct mmid_cache_entry * mmid_victim(size_t size) {
++    struct mmid_cache_entry * chosen = NULL;
++    if (mmid_lru == 0) {
++        // the default scan, also skipping pinned and loading slices
++        for (size_t j = 0; j < MMID_CACHE_SLOTS; j++) {
++            const struct mmid_cache_entry * c = &mmid_cache[j];
++            if (c->buf && c->tick + 1024 < mmid_cache_tick && mmid_evictable(c) && (!chosen || c->tick < chosen->tick)) { chosen = &mmid_cache[j]; }
++        }
++        return chosen;
++    }
++    if (mmid_lru == 2) {
++        // take_victim, ClassLRU: the oldest unpinned slice of each class, scored age / 2^class
++        double best = -1;
++        for (int cls = 0; cls < MMID_CLASSES; cls++) {
++            struct mmid_cache_entry * c = mmid_oldest_unpinned(cls);
++            if (!c || c->tensor < 0) { continue; }
++            const double score = ldexp((double) (mmid_tensors[c->tensor].clock - mmid_tensors[c->tensor].last[c->expert]), -cls);
++            if (score > best) { best = score; chosen = c; }
++        }
++        return chosen;
++    }
++    // take_victim with size_lru: the oldest slice of the same size when there is one, else the oldest of any size
++    if (size) {
++        chosen = mmid_oldest_unpinned(mmid_size_class(size));
++        if (chosen) { return chosen; }
++    }
++    for (int l = 0; l < mmid_n_sizes; l++) {
++        struct mmid_cache_entry * c = mmid_oldest_unpinned(l);
++        if (c && (!chosen || c->tick < chosen->tick)) { chosen = c; }
++    }
++    return chosen;
++}
++
++// prefill scratch (COALESCE): [0] the slices of the current op, [1] the read-ahead of its down op; counted in the budget
++static char * mmid_scratch[2];
++static size_t mmid_scratch_cap[2], mmid_scratch_bytes = 0, mmid_scratch_used[2];
++static struct mmid_cache_entry mmid_bp[2][1024]; // scratch-backed slices, by expert
++static bool   mmid_bp1_valid[1024];
++static const char * mmid_bp1_base = NULL;
++
++// evict until size more bytes fit; returns a same-size victim's buffer when there is one
++static char * mmid_make_room(size_t size, bool slice, bool optional, bool * ok) {
++    char * buf = NULL;
++    *ok = true;
++    while (mmid_cache_bytes + mmid_scratch_bytes + size > mmid_cache_budget) {
++        struct mmid_cache_entry * old = mmid_victim(slice ? size : 0);
++        if (!old) { *ok = !optional; break; }
++        mmid_unlink_lru(old);
++        mmid_cache_bytes -= old->size;
++        if (old->size == size && !buf) { buf = old->buf; } else { free(old->buf); }
++        old->buf = NULL;
++    }
++    return buf;
++}
++
++static bool mmid_scratch_reserve(int s, size_t need) {
++    mmid_scratch_used[s] = 0;
++    if (need <= mmid_scratch_cap[s]) { return true; }
++    free(mmid_scratch[s]); mmid_scratch[s] = NULL;
++    mmid_scratch_bytes -= mmid_scratch_cap[s]; mmid_scratch_cap[s] = 0;
++    bool ok;
++    free(mmid_make_room(need, false, false, &ok)); // a prompt workspace reclaims cold slices to fit (Atomic Engine reclaim_to_fit)
++    if (posix_memalign((void **) &mmid_scratch[s], MMID_ALIGN, need) != 0) { mmid_scratch[s] = NULL; return false; }
++    mmid_scratch_cap[s] = need; mmid_scratch_bytes += need;
++    return true;
++}
++
++static struct mmid_cache_entry * mmid_bp_entry(int s, int cur_a, const char * key, size_t file_size, size_t size,
++                                               enum ggml_type type, int64_t ne0, int64_t ne1, bool repacked) {
++    struct mmid_cache_entry * e = &mmid_bp[s][cur_a];
++    if (mmid_scratch_used[s] + size > mmid_scratch_cap[s]) { return NULL; }
++    e->key = key; e->size = size; e->buf = mmid_scratch[s] + mmid_scratch_used[s];
++    e->file_size = file_size; e->ne0 = ne0; e->ne1 = ne1; e->src_type = type; e->repacked = repacked;
++    mmid_scratch_used[s] += GGML_PAD(size, 64);
++    atomic_store_explicit(&e->state, MMID_LOADING, memory_order_relaxed);
++    mmid_bypass_reads++;
++    return e;
++}
++
++// wait for scratch-1 read-ahead that no op consumed before its scratch is reused or freed
++static void mmid_drain_bp1(void) {
++    for (int i = 0; i < 1024; i++) {
++        if (mmid_bp1_valid[i]) { mmid_pf_wasted++; mmid_bp1_valid[i] = false; }
++        if (mmid_bp[1][i].key) { mmid_promote(&mmid_bp[1][i]); mmid_wait(&mmid_bp[1][i], 1); mmid_bp[1][i].key = NULL; }
++    }
++    mmid_bp1_base = NULL;
++}
++
++// ---- cache table
++static struct mmid_cache_entry * mmid_slot(const char * key) {
++    size_t i = ((uintptr_t) key >> 6) % MMID_CACHE_SLOTS;
++    while (mmid_cache[i].key && mmid_cache[i].key != key) { i = (i + 1) % MMID_CACHE_SLOTS; }
++    return &mmid_cache[i];
++}
++
++static void mmid_touch_entry(struct mmid_cache_entry * e) {
++    e->tick = ++mmid_cache_tick;
++    if (!mmid_lru) { return; }
++    mmid_unlink_lru(e);
++    e->list = mmid_lru == 2 ? mmid_touch(e->tensor, e->expert) : e->sz;
++    mmid_append_lru(e);
++}
++
++// a new LOADING slice in the cache, or NULL (optional and no unpinned victim, or no memory)
++static struct mmid_cache_entry * mmid_new_entry(const char * key, size_t file_size, size_t size,
++                                                enum ggml_type type, int64_t ne0, int64_t ne1, bool repacked,
++                                                int t, int expert, bool optional) {
++    bool ok;
++    char * buf = mmid_make_room(size, true, optional, &ok);
++    if (!ok) { free(buf); return NULL; }
++    if (!buf && posix_memalign((void **) &buf, MMID_ALIGN, size) != 0) { return NULL; }
++    struct mmid_cache_entry * e = mmid_slot(key);
++    e->key = key; e->buf = buf; e->size = size;
++    e->file_size = file_size; e->ne0 = ne0; e->ne1 = ne1; e->src_type = type; e->repacked = repacked;
++    e->sz = mmid_size_class(size); e->tensor = t; e->expert = expert;
++    atomic_store_explicit(&e->state, MMID_LOADING, memory_order_relaxed);
++    mmid_cache_bytes += size;
++    mmid_cache_misses++; mmid_cache_miss_bytes += file_size;
++    mmid_touch_entry(e);
++    return e;
++}
++
++// per op: the pins to drop at the next op, the read-ahead entries, the compute order and the slices to wait for
++static struct mmid_cache_entry * mmid_pinned[2048], * mmid_pf[1024], * mmid_wait_e[1024], * mmid_pend[1024];
++static int mmid_n_pinned = 0, mmid_n_pf = 0, mmid_order[1024], mmid_n_order = 0;
++
++static void mmid_pin(struct mmid_cache_entry * e) { e->pins++; mmid_pinned[mmid_n_pinned++] = e; }
++
++// read-ahead that no down op consumed: wasted (the slice stays cached, unpinned)
++static void mmid_retire_prefetch(void) {
++    for (int i = 0; i < mmid_n_pf; i++) {
++        struct mmid_cache_entry * e = mmid_pf[i];
++        if (!e->prefetched) { continue; }
++        e->prefetched = false; e->pins--;
++        if (e->pf_issued) { e->pf_issued = false; mmid_pf_wasted++; }
++    }
++    mmid_n_pf = 0;
++}
++
++// known-route overlap: the down op of this layer uses the same experts; read its missing slices on the low queue
++static void mmid_prefetch_down(const char * down, size_t nb2, enum ggml_type down_type, int64_t down_ne0, int64_t down_ne1,
++                               int n_as, const int64_t * counts, const bool * bypass_a, uint64_t tokens) {
++    const int t = mmid_lru == 2 ? mmid_tensor_id(down, n_as) : -1;
++    mmid_begin_projection(t, tokens);
++    mmid_drain_bp1();
++    const size_t rep_sz = mmid_repack_mode ? ggml_mmid_repack_info(down_type, down_ne0, down_ne1, mmid_repack_mode, NULL) : 0;
++    const bool do_repack = rep_sz > 0;
++    const size_t entry_sz = do_repack ? rep_sz : nb2;
++    size_t need = 0;
++    for (int a = 0; a < n_as; a++) {
++        if (counts[a] > 0 && bypass_a[a] && !mmid_slot(down + a * nb2)->buf) { need += GGML_PAD(entry_sz, 64); }
++    }
++    const bool scratch_ok = need == 0 || mmid_scratch_reserve(1, need);
++    mmid_bp1_base = down;
++    int n = 0;
++    // resident down slices first, so the read-ahead below cannot evict them
++    for (int a = 0; a < n_as; a++) {
++        if (counts[a] == 0) { continue; }
++        struct mmid_cache_entry * e = mmid_slot(down + a * nb2);
++        if (e->buf && !e->prefetched) { e->prefetched = true; e->pins++; mmid_pf[mmid_n_pf++] = e; }
++    }
++    for (int a = 0; a < n_as; a++) {
++        if (counts[a] == 0) { continue; }
++        const char * key = down + a * nb2;
++        if (mmid_slot(key)->buf) { continue; }
++        struct mmid_cache_entry * e;
++        if (bypass_a[a]) {
++            if (!scratch_ok || !(e = mmid_bp_entry(1, a, key, nb2, entry_sz, down_type, down_ne0, down_ne1, do_repack))) { continue; }
++            mmid_bp1_valid[a] = true;
++        } else {
++            e = mmid_new_entry(key, nb2, entry_sz, down_type, down_ne0, down_ne1, do_repack, t, a, true);
++            if (!e) { break; } // no unpinned victim: skip the rest of the read-ahead
++            e->prefetched = true; e->pf_issued = true; e->pins++; mmid_pf[mmid_n_pf++] = e;
++        }
++        mmid_pf_issued++;
++        mmid_pend[n++] = e;
++    }
++    mmid_issue(mmid_pend, n, false);
++}
++
++static void mmid_port_prologue(const char * base, size_t nb02, enum ggml_type type, int64_t ne0, int64_t ne1,
++                               int n_as, const int64_t * counts, const struct ggml_tensor * ids) {
++    const uint64_t tokens = (uint64_t) ids->ne[1];
++    const bool prefill = tokens > 1;
++    // the previous op is done on every thread (node barrier)
++    for (int i = 0; i < mmid_n_pinned; i++) { mmid_pinned[i]->pins--; }
++    mmid_n_pinned = 0;
++    if (!prefill && mmid_scratch_bytes) {
++        // first decode op: return the prompt scratch to the cache budget
++        mmid_drain_bp1();
++        for (int s = 0; s < 2; s++) { free(mmid_scratch[s]); mmid_scratch[s] = NULL; mmid_scratch_cap[s] = 0; }
++        mmid_scratch_bytes = 0;
++    }
++    const char * down = NULL; size_t down_nb2 = 0;
++    enum ggml_type down_type = GGML_TYPE_F32; int64_t down_ne0 = 0, down_ne1 = 0;
++    const bool pair = mmid_overlap && ggml_mmid_get_pair_meta(base, &down, &down_nb2, &down_type, &down_ne0, &down_ne1);
++    if (pair) { mmid_retire_prefetch(); }
++    const int t = mmid_lru == 2 ? mmid_tensor_id(base, n_as) : -1;
++    mmid_begin_projection(t, tokens);
++
++    // prefill non-tail bypass: only the experts of the last prompt row go to the cache. Atomic Engine marks the prompt
++    // tail only for ubatches of >= 512 tokens (src/llama-context.cpp, mark_inkling_prompt_tail); shorter prompts are cached
++    const bool bypass = mmid_coalesce && tokens >= MMID_BYPASS_MIN_TOKENS;
++    static bool bypass_a[1024];
++    for (int a = 0; a < n_as; a++) { bypass_a[a] = bypass && counts[a] > 0; }
++    if (bypass) {
++        for (int id = 0; id < ids->ne[0]; id++) {
++            const int32_t a = *(const int32_t *) ((const char *) ids->data + (tokens - 1)*ids->nb[1] + id*ids->nb[0]);
++            if (a >= 0 && a < n_as) { bypass_a[a] = false; }
++        }
++    }
++
++    const size_t rep_sz = mmid_repack_mode ? ggml_mmid_repack_info(type, ne0, ne1, mmid_repack_mode, NULL) : 0;
++    const bool do_repack = rep_sz > 0;
++    const size_t entry_sz = do_repack ? rep_sz : nb02;
++
++    int n_ready = 0, n_wait = 0, n_pend = 0;
++    static int wait_a[1024], miss_a[1024];
++    int n_miss = 0;
++    const bool bp1 = mmid_bp1_base == base;
++    for (int a = 0; a < n_as; a++) {
++        mmid_wait_e[a] = NULL;
++        mmid_cache_repacked[a] = false;
++        if (counts[a] == 0) { continue; }
++        const char * key = base + a * nb02;
++        struct mmid_cache_entry * e = mmid_slot(key);
++        if (e->buf) {
++            if (e->prefetched) {
++                mmid_pin(e); e->prefetched = false; e->pins--; // the read-ahead pin becomes this op's pin
++                if (e->pf_issued) { e->pf_issued = false; mmid_pf_used++; }
++                e->tick = ++mmid_cache_tick;
++            } else {
++                mmid_touch_entry(e); mmid_pin(e);
++            }
++            mmid_cache_hits++;
++        } else if (bp1 && mmid_bp1_valid[a] && mmid_bp[1][a].key == key) {
++            e = &mmid_bp[1][a]; mmid_bp1_valid[a] = false; mmid_pf_used++;
++        } else {
++            miss_a[n_miss++] = a;
++            continue;
++        }
++        mmid_cache_ptr[a] = e->buf;
++        mmid_cache_repacked[a] = e->repacked;
++        if (atomic_load_explicit(&e->state, memory_order_acquire) == MMID_LOADING) {
++            mmid_promote(e); mmid_wait_e[a] = e; wait_a[n_wait++] = a;
++        } else {
++            mmid_order[n_ready++] = a;
++        }
++    }
++
++    size_t need = 0;
++    for (int i = 0; i < n_miss; i++) { if (bypass_a[miss_a[i]]) { need += GGML_PAD(entry_sz, 64); } }
++    const bool scratch_ok = need == 0 || mmid_scratch_reserve(0, need);
++    for (int i = 0; i < n_miss; i++) {
++        const int a = miss_a[i];
++        const char * key = base + a * nb02;
++        struct mmid_cache_entry * e = NULL;
++        if (bypass_a[a] && scratch_ok) {
++            e = mmid_bp_entry(0, a, key, nb02, entry_sz, type, ne0, ne1, do_repack);
++            if (e) { mmid_cache_misses++; mmid_cache_miss_bytes += nb02; }
++        }
++        if (!e) { e = mmid_new_entry(key, nb02, entry_sz, type, ne0, ne1, do_repack, t, a, false); if (e) { mmid_pin(e); } }
++        if (!e) { mmid_cache_ptr[a] = key; mmid_cache_repacked[a] = false; mmid_order[n_ready++] = a; continue; } // no memory: read the mapping
++        mmid_cache_ptr[a] = e->buf;
++        mmid_cache_repacked[a] = e->repacked;
++        mmid_wait_e[a] = e; wait_a[n_wait++] = a;
++        mmid_pend[n_pend++] = e;
++    }
++    mmid_issue(mmid_pend, n_pend, true);
++    if (pair) { mmid_prefetch_down(down, down_nb2, down_type, down_ne0, down_ne1, n_as, counts, bypass_a, tokens); }
++
++    // resident experts first, then the ones still loading
++    for (int i = 0; i < n_wait; i++) { mmid_order[n_ready + i] = wait_a[i]; }
++    mmid_n_order = n_ready + n_wait;
++}
++
++static int mmid_env(const char * name) { const char * v = getenv(name); return v ? atoi(v) : 0; }
++
++GGML_BACKEND_API void ggml_cpu_mmid_stats_reset(void);
++void ggml_cpu_mmid_stats_reset(void) {
++    mmid_wait_us = 0;
++    mmid_pf_issued = 0;
++    mmid_pf_used = 0;
++    mmid_pf_wasted = 0;
++    mmid_bypass_reads = 0;
++    atomic_store(&mmid_read_bytes, 0);
++    atomic_store(&mmid_read_calls, 0);
++    atomic_store(&mmid_repacked_slices, 0);
++    atomic_store(&mmid_repack_us, 0);
++    atomic_store(&mmid_cecar_calls, 0);
++    atomic_store(&mmid_cecar_swaps, 0);
++}
++
++GGML_BACKEND_API void ggml_cpu_mmid_stats_dump(void);
++void ggml_cpu_mmid_stats_dump(void) {
++    if (!mmid_stats_on) return;
++    mmid_stats_on = 0;
++    fprintf(stderr, "[mmid] overlap=%d lru=%d coalesce=%d repack=%d budget_mb=%zu hits=%llu misses=%llu read_mb=%.1f read_calls=%llu wait_ms=%.1f "
++        "prefetch_issued=%llu prefetch_used=%llu prefetch_wasted=%llu bypass_reads=%llu repacked=%llu repack_ms=%.1f cecar_bonus=%.4f cecar_calls=%llu cecar_swaps=%llu\n",
++        mmid_overlap, mmid_lru, mmid_coalesce, mmid_repack_mode, mmid_cache_budget >> 20, (unsigned long long) mmid_cache_hits, (unsigned long long) mmid_cache_misses,
++        (double) atomic_load(&mmid_read_bytes) / 1048576.0, (unsigned long long) atomic_load(&mmid_read_calls), mmid_wait_us / 1000.0,
++        (unsigned long long) mmid_pf_issued, (unsigned long long) mmid_pf_used, (unsigned long long) mmid_pf_wasted, (unsigned long long) mmid_bypass_reads,
++        (unsigned long long) atomic_load(&mmid_repacked_slices), (double) atomic_load(&mmid_repack_us) / 1000.0,
++        (double) ggml_cpu_mmid_cecar_bonus(), (unsigned long long) atomic_load(&mmid_cecar_calls), (unsigned long long) atomic_load(&mmid_cecar_swaps));
++    fflush(stderr);
++}
++
++static void mmid_port_exit(void) {
++    if (mmid_io.n_threads) {
++        pthread_mutex_lock(&mmid_io.mu); mmid_io.stop = true; pthread_cond_broadcast(&mmid_io.work); pthread_mutex_unlock(&mmid_io.mu);
++        for (int i = 0; i < mmid_io.n_threads; i++) { pthread_join(mmid_io.threads[i], NULL); }
++        mmid_io.n_threads = 0;
++    }
++    ggml_cpu_mmid_stats_dump();
++}
++
++static void mmid_port_init(void) {
++    mmid_overlap = mmid_env("GGML_MMID_OVERLAP") == 1;
++    mmid_lru = mmid_env("GGML_MMID_LRU"); if (mmid_lru < 0 || mmid_lru > 2) { mmid_lru = 0; }
++    mmid_coalesce = mmid_env("GGML_MMID_COALESCE") == 1;
++    mmid_stats_on = mmid_env("GGML_MMID_STATS") == 1;
++    if (mmid_overlap) {
++        for (int i = MMID_TASKS - 1; i >= 0; i--) { mmid_io.tasks[i].next = mmid_io.free_list; mmid_io.free_list = &mmid_io.tasks[i]; }
++        pthread_attr_t attr;
++        pthread_attr_init(&attr);
++        pthread_attr_setstacksize(&attr, 256 * 1024); // Atomic Engine reader stack size
++        int n_io = mmid_env("GGML_MMID_IO_THREADS");
++        if (n_io < 1 || n_io > MMID_IO_THREADS_MAX) { n_io = MMID_IO_THREADS; }
++        for (int i = 0; i < n_io; i++) {
++            if (pthread_create(&mmid_io.threads[i], &attr, mmid_io_main, NULL) != 0) { break; }
++            mmid_io.n_threads++;
++        }
++        pthread_attr_destroy(&attr);
++        if (mmid_io.n_threads == 0) { mmid_overlap = 0; fprintf(stderr, "%s: no reader threads, GGML_MMID_OVERLAP off\n", __func__); }
++    }
++    if (mmid_overlap || mmid_stats_on) { atexit(mmid_port_exit); }
++}
++#else
++static int  mmid_order[1], mmid_n_order = 0;
++static bool mmid_port_active(void) { return false; }
++static void mmid_port_init(void) { }
++#endif
++
+ // ggml_compute_forward_mul_mat_id
+ 
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+@@ -1704,7 +2602,28 @@ static void ggml_compute_forward_mul_mat_id(
+                 matrix_row_counts[i02] += 1;
+             }
+         }
++        if (mmid_cache_on() && n_as <= 1024) {
++#ifdef MMID_PORT
++            if (mmid_port_active()) {
++                mmid_port_prologue((const char *) src0->data, nb02, src0->type, ne00, ne01, n_as, matrix_row_counts, ids);
++            } else
++#endif
++            {
++                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++                    mmid_cache_repacked[cur_a] = false;
++                    if (matrix_row_counts[cur_a] > 0) {
++                        mmid_cache_ptr[cur_a] = mmid_cache_get((const char *) src0->data + cur_a * nb02, nb02,
++                                                               src0->type, ne00, ne01, &mmid_cache_repacked[cur_a]);
++                    }
++                }
++                const int64_t t0 = mmid_stats_on ? ggml_time_us() : 0;
++                mmid_cache_fill();
++                if (mmid_stats_on) { mmid_wait_us += ggml_time_us() - t0; }
++            }
++        }
+     }
++    const bool use_cache = mmid_cache_on() && n_as <= 1024;
++    const bool use_port  = use_cache && mmid_port_active(); // order: resident experts first (mmid_port_prologue)
+ 
+     // reset current_chunk
+     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+@@ -1714,19 +2633,31 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+     ggml_barrier(params->threadpool);
+ 
+-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++    const int n_iter = use_port ? mmid_n_order : n_as;
++    for (int k = 0; k < n_iter; ++k) {
++        const int cur_a = use_port ? mmid_order[k] : k;
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+         if (cne1 == 0) {
+             continue;
+         }
++#ifdef MMID_PORT
++        if (use_port && mmid_wait_e[cur_a]) {
++            mmid_wait(mmid_wait_e[cur_a], ith); // a miss of this op: wait for its own read only
++        }
++#endif
+ 
+         // tiled takes over if profitable for this expert (see tiled.h)
+-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
++        if (!use_cache && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+             continue;
+         }
+ 
+-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++        const char * src0_cur = use_cache ? mmid_cache_ptr[cur_a] : (const char *) src0->data + cur_a * nb02;
++        const bool is_repacked = use_cache && mmid_cache_repacked[cur_a];
++        int rep_nb_cols = 1;
++        if (is_repacked) {
++            ggml_mmid_repack_info(type, ne00, ne01, mmid_repack_mode, &rep_nb_cols);
++        }
+         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+@@ -1749,7 +2680,10 @@ static void ggml_compute_forward_mul_mat_id(
+             nchunk1 = nr0 > nr1 ? 1 : nth;
+         }
+ 
+-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
++        int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
++        if (is_repacked && rep_nb_cols > 1) {
++            dr0 = ((dr0 + rep_nb_cols - 1) / rep_nb_cols) * rep_nb_cols;
++        }
+         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+ 
+         int current_chunk = ith;
+@@ -1766,11 +2700,30 @@ static void ggml_compute_forward_mul_mat_id(
+             const int64_t ir1_start = dr1 * ith1;
+             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+ 
+-            ggml_compute_forward_mul_mat_id_one_chunk(
+-                dst, src0, src1, ids, cur_a,
+-                ir0_start, ir0_end, ir1_start, ir1_end,
+-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+-            );
++            if (ir0_start < ir0_end && ir1_start < ir1_end) {
++                const int64_t emu_t0 = ggml_cpu_emu_now(params);
++                if (is_repacked) {
++                    for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
++                        struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
++                        const int id = row_mapping.i1;
++                        const int64_t i11 = id % ne11;
++                        const int64_t i12 = row_mapping.i2;
++                        const char * src1_col = (const char *) wdata +
++                            (src1_cont || src1->type != vec_dot_type
++                            ? (i11      + i12*ne11)*row_size
++                            : (i11*nb11 + i12*nb12));
++                        float * dst_col = (float *) ((char *) dst->data + (id*nb1 + i12*nb2));
++                        ggml_mmid_repack_gemv(type, ne00, ne01, src0_cur, ir0_start, ir0_end, src1_col, dst_col + ir0_start);
++                    }
++                } else {
++                    ggml_compute_forward_mul_mat_id_one_chunk(
++                        dst, src0, src1, ids, cur_a,
++                        ir0_start, ir0_end, ir1_start, ir1_end,
++                        src0_cur, matrix_rows, row_size, src1_cont, wdata
++                    );
++                }
++                ggml_cpu_emu_stretch(emu_t0);
++            }
+ 
+             if (nth >= nchunk0 * nchunk1) {
+                 break;
+@@ -3137,6 +4090,47 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// node profile (env GGML_NODE_PROF=1): per-op count, compute time and barrier wait, measured on thread 0
++static int      node_prof_state = -1;
++static uint64_t node_prof_n[GGML_OP_COUNT][2], node_prof_us[GGML_OP_COUNT][2], node_prof_bar_us[GGML_OP_COUNT][2];
++// MUL_MAT / MUL_MAT_ID broken down by weight tensor shape and type
++struct node_prof_mm { int op, type; int64_t ne0, ne1, ne2; uint64_t n, us, bar_us; };
++static struct node_prof_mm node_prof_mm[96];
++static void node_prof_mm_add(const struct ggml_tensor * node, int64_t us, int64_t bar_us) {
++    const struct ggml_tensor * w = node->src[0];
++    for (int i = 0; i < 96; i++) {
++        struct node_prof_mm * e = &node_prof_mm[i];
++        if (e->n == 0) { e->op = node->op; e->type = w->type; e->ne0 = w->ne[0]; e->ne1 = w->ne[1]; e->ne2 = w->ne[2]; }
++        if (e->op == (int) node->op && e->type == (int) w->type && e->ne0 == w->ne[0] && e->ne1 == w->ne[1] && e->ne2 == w->ne[2]) {
++            e->n++; e->us += us; e->bar_us += bar_us; return;
++        }
++    }
++}
++GGML_BACKEND_API void ggml_cpu_node_prof_reset(void);
++void ggml_cpu_node_prof_reset(void) {
++    memset(node_prof_mm, 0, sizeof(node_prof_mm)); memset(node_prof_n, 0, sizeof(node_prof_n));
++    memset(node_prof_us, 0, sizeof(node_prof_us)); memset(node_prof_bar_us, 0, sizeof(node_prof_bar_us));
++}
++GGML_BACKEND_API void ggml_cpu_node_prof_dump(void);
++void ggml_cpu_node_prof_dump(void) {
++    for (int i = 0; i < 96 && node_prof_mm[i].n; i++) {
++        const struct node_prof_mm * e = &node_prof_mm[i];
++        fprintf(stderr, "mmprof %-10s %-8s %6lld x %6lld x %4lld n=%7llu compute_ms=%9.1f barrier_ms=%8.1f\n", ggml_op_name((enum ggml_op) e->op),
++            ggml_type_name((enum ggml_type) e->type), (long long) e->ne0, (long long) e->ne1, (long long) e->ne2,
++            (unsigned long long) e->n, e->us / 1000.0, e->bar_us / 1000.0);
++    }
++    for (int k = 0; k < 2; k++) for (int i = 0; i < GGML_OP_COUNT; i++) if (node_prof_n[i][k]) {
++        fprintf(stderr, "nodeprof %-16s %s n=%8llu compute_ms=%9.1f barrier_ms=%9.1f\n", ggml_op_name((enum ggml_op) i), k ? "multi " : "single",
++            (unsigned long long) node_prof_n[i][k], node_prof_us[i][k] / 1000.0, node_prof_bar_us[i][k] / 1000.0);
++    }
++}
++static bool node_prof_on(void) {
++    if (node_prof_state < 0) {
++        node_prof_state = getenv("GGML_NODE_PROF") != NULL;
++    }
++    return node_prof_state == 1;
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3149,6 +4143,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ #else
+     set_numa_thread_affinity(state->ith);
+ #endif
++    ggml_cpu_apply_thread_qos();
++    ggml_cpu_emu_init();
++    const int small_max = ggml_cpu_small_node_max();
++    const int small_nth = ggml_cpu_small_threads();
+ 
+     struct ggml_compute_params params = {
+         /*.ith        =*/ state->ith,
+@@ -3179,12 +4177,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+-        if (n_fused > 0) {
+-            node_n += n_fused;
++        const bool prof = state->ith == 0 && node_prof_on();
++        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
++        const bool chunk_stretch = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_FLASH_ATTN_EXT;
++        const int64_t emu_t0 = chunk_stretch ? 0 : ggml_cpu_emu_now(&params);
++        if (small_max > 0 && params.nth > small_nth && ggml_cpu_node_is_small(node, small_max)) {
++            if (params.ith < small_nth) {
++                struct ggml_compute_params few = params;
++                few.nth = small_nth;
++                ggml_compute_forward(&few, node);
++            }
+         } else {
+-            ggml_compute_forward(&params, node);
++            const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
++            if (n_fused > 0) {
++                node_n += n_fused;
++            } else {
++                ggml_compute_forward(&params, node);
++            }
+         }
++        ggml_cpu_emu_stretch(emu_t0);
++        const int64_t prof_t1 = prof ? ggml_time_us() : 0;
+ 
+         if (state->ith == 0 && cplan->abort_callback &&
+                 cplan->abort_callback(cplan->abort_callback_data)) {
+@@ -3195,6 +4207,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (prof) {
++            const int k = ggml_get_n_tasks(node, params.nth) > 1;
++            node_prof_n[node->op][k]++;
++            node_prof_us[node->op][k] += prof_t1 - prof_t0;
++            const int64_t prof_t2 = ggml_time_us();
++            node_prof_bar_us[node->op][k] += prof_t2 - prof_t1;
++            if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) { node_prof_mm_add(node, prof_t1 - prof_t0, prof_t2 - prof_t1); }
++        }
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 2978340..ace25a9 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -107,8 +107,36 @@ struct ggml_backend_cpu_context {
+     void *              abort_callback_data;
+ 
+     bool                use_ref;  // use reference implementation
++
++    ggml_threadpool_t   own_pool;   // GGML_CPU_PERSIST_POOL: pool kept across graphs when none is attached
++    int                 own_pool_n;
+ };
+ 
++// GGML_CPU_PERSIST_POOL=1 (sage-lab, runs/speed/THREAD_SCALING.md): with no threadpool attached, keep one pool alive
++// across graphs instead of creating and joining a disposable pool (new threads) for every graph. GGML_CPU_POLL=<0..100>
++// sets its polling level (ggml default 50). Off by default.
++static bool ggml_backend_cpu_persist_pool(void) {
++    static int state = -1;
++    if (state < 0) { const char * v = getenv("GGML_CPU_PERSIST_POOL"); state = v && atoi(v) == 1; }
++    return state == 1;
++}
++
++static ggml_threadpool_t ggml_backend_cpu_get_own_pool(struct ggml_backend_cpu_context * ctx) {
++    if (ctx->own_pool && ctx->own_pool_n == ctx->n_threads) {
++        return ctx->own_pool;
++    }
++    if (ctx->own_pool) {
++        ggml_threadpool_free(ctx->own_pool);
++        ctx->own_pool = NULL;
++    }
++    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(ctx->n_threads);
++    const char * poll = getenv("GGML_CPU_POLL");
++    if (poll) { tpp.poll = (uint32_t) atoi(poll); }
++    ctx->own_pool   = ggml_threadpool_new(&tpp);
++    ctx->own_pool_n = ctx->own_pool ? ctx->n_threads : 0;
++    return ctx->own_pool;
++}
++
+ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
+     return "CPU";
+ 
+@@ -117,6 +145,9 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
+ 
+ static void ggml_backend_cpu_free(ggml_backend_t backend) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
++    if (cpu_ctx->own_pool) {
++        ggml_threadpool_free(cpu_ctx->own_pool);
++    }
+     delete[] cpu_ctx->work_data;
+     delete cpu_ctx;
+     delete backend;
+@@ -170,7 +201,11 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
+ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
++    ggml_threadpool_t tp = cpu_ctx->threadpool;
++    if (!tp && cpu_ctx->n_threads > 1 && ggml_backend_cpu_persist_pool()) {
++        tp = ggml_backend_cpu_get_own_pool(cpu_ctx);
++    }
++    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, tp);
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+         delete[] cpu_ctx->work_data;
+@@ -230,6 +265,8 @@ ggml_backend_t ggml_backend_cpu_init(void) {
+     ctx->abort_callback      = NULL;
+     ctx->abort_callback_data = NULL;
+     ctx->use_ref             = false;
++    ctx->own_pool            = NULL;
++    ctx->own_pool_n          = 0;
+ 
+     ggml_backend_t cpu_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_cpu_guid(),
+@@ -691,6 +728,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
+         return (void *)ggml_backend_cpu_set_threadpool;
+     }
++    if (strcmp(name, "ggml_cpu_lm_head_get_ops") == 0) {
++        return (void *)ggml_cpu_lm_head_get_ops;
++    }
+ 
+     return NULL;
+ 
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index cd81347..d534a0a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8747,6 +8747,11 @@ static void ggml_compute_forward_argsort_f32(
+ 
+     ggml_sort_order order = (ggml_sort_order) ggml_get_op_params_i32(dst, 0);
+ 
++    const float cecar_bonus = (order == GGML_SORT_ORDER_DESC && nr == 1 && ne0 <= 512) ? ggml_cpu_mmid_cecar_bonus() : 0.0f;
++    const char * cecar_base = nullptr;
++    size_t cecar_nb2 = 0;
++    const bool use_cecar = cecar_bonus > 0.0f && ggml_mmid_get_router(dst, &cecar_base, &cecar_nb2);
++
+     for (int64_t i = ith; i < nr; i += nth) {
+         const float * src_data = (float *)((char *) src0->data + i*nb01);
+ 
+@@ -8756,6 +8761,26 @@ static void ggml_compute_forward_argsort_f32(
+             dst_data[j] = j;
+         }
+ 
++        if (use_cecar) {
++            float adj[512];
++            int32_t orig[512];
++            for (int64_t j = 0; j < ne0; j++) {
++                orig[j] = (int32_t) j;
++                adj[j] = src_data[j] + (ggml_cpu_mmid_is_cached(cecar_base, cecar_nb2, (int) j) ? cecar_bonus : 0.0f);
++            }
++            std::sort(dst_data, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_DESC>{adj});
++            std::partial_sort(orig, orig + (ne0 < 4 ? ne0 : 4), orig + ne0, cmp_argsort<GGML_SORT_ORDER_DESC>{src_data});
++            int swaps = 0;
++            int kchk = ne0 < 4 ? (int) ne0 : 4;
++            for (int a = 0; a < kchk; a++) {
++                bool found = false;
++                for (int b = 0; b < kchk; b++) { if (dst_data[a] == orig[b]) { found = true; break; } }
++                if (!found) { swaps++; }
++            }
++            ggml_cpu_mmid_cecar_note(swaps);
++            continue;
++        }
++
+         switch (order) {
+             case GGML_SORT_ORDER_ASC:
+                 std::sort(dst_data, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_ASC>{src_data});
+@@ -9511,6 +9536,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         const int64_t partial_stride = nth * partial_size;
+         float *       chunk_partials = partials_base + ith * partial_size;
+ 
++        const int64_t emu_t0 = ggml_cpu_emu_now(params); // GGML_CPU_EMU_SLOW measurement aid
+         if (ic_start < nek1) {
+             for (int64_t q_head = 0; q_head < neq2; q_head++) {
+                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -9525,6 +9551,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+             }
+         }
+ 
++        ggml_cpu_emu_stretch(emu_t0);
+         ggml_barrier(params->threadpool);
+         ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
+     } else {
+@@ -9572,11 +9599,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+             const int64_t ir0 = dr * current_chunk;
+             const int64_t ir1 = MIN(ir0 + dr, nr);
+ 
++            const int64_t emu_t0 = ggml_cpu_emu_now(params); // GGML_CPU_EMU_SLOW measurement aid
+             if (use_tiled) {
+                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+             } else {
+                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_kv_cols, nullptr, 0);
+             }
++            ggml_cpu_emu_stretch(emu_t0);
+ 
+             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+         }
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 9282ca2..2fb9157 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4711,7 +4711,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+         // 4x chunks per thread
+         const int64_t nr0 = ggml_nrows(op->src[0]);
+ 
+-        int     nth_scaled  = nth * 4;
++        int     nth_scaled  = nth * (ggml_cpu_fine_chunks() ? 16 : 4); // GGML_CPU_FINE_CHUNKS: 16x chunks per thread
+         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
+         int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
+ 
+@@ -4774,7 +4774,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                 continue;
+             }
+ 
++            const int64_t emu_t0 = ggml_cpu_emu_now(params);
+             forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, src1_start, src1_end);
++            ggml_cpu_emu_stretch(emu_t0);
+ 
+             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+         }
+@@ -5258,3 +5260,313 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
+ 
+     return &ggml_backend_cpu_buffer_type_repack;
+ }
++
++extern "C" {
++
++size_t ggml_mmid_repack_info(enum ggml_type type, int64_t ne0, int64_t ne1, int mode, int * out_nb_cols) {
++    if (mode <= 0 || ne0 <= 0 || ne1 <= 0) {
++        return 0;
++    }
++    const bool arm_dp = ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
++    if (!arm_dp) {
++        return 0;
++    }
++    switch (type) {
++        case GGML_TYPE_MXFP4:
++            if (ne0 % QK_MXFP4 == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK_MXFP4) * sizeof(block_mxfp4x4);
++            }
++            return 0;
++        case GGML_TYPE_Q4_0:
++            if (ne0 % QK4_0 == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK4_0) * sizeof(block_q4_0x4);
++            }
++            return 0;
++        case GGML_TYPE_IQ4_NL:
++            if (ne0 % QK4_NL == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK4_NL) * sizeof(block_iq4_nlx4);
++            }
++            return 0;
++        case GGML_TYPE_Q8_0:
++            if (ne0 % QK8_0 == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK8_0) * sizeof(block_q8_0x4);
++            }
++            return 0;
++        case GGML_TYPE_Q1_0:
++            if (ne0 % QK1_0 == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK1_0) * sizeof(block_q1_0x4);
++            }
++            return 0;
++        case GGML_TYPE_Q4_K:
++            if (ne0 % QK_K == 0 && ne1 % 8 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 8; }
++                return (size_t) (ne1 / 8) * (size_t) (ne0 / QK_K) * sizeof(block_q4_Kx8);
++            }
++            return 0;
++        case GGML_TYPE_Q5_K:
++            if (ne0 % QK_K == 0 && ne1 % 8 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 8; }
++                return (size_t) (ne1 / 8) * (size_t) (ne0 / QK_K) * sizeof(block_q5_Kx8);
++            }
++            return 0;
++        case GGML_TYPE_Q6_K:
++            if (ne0 % QK_K == 0 && ne1 % 8 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 8; }
++                return (size_t) (ne1 / 8) * (size_t) (ne0 / QK_K) * sizeof(block_q6_Kx8);
++            }
++            return 0;
++        case GGML_TYPE_Q2_0:
++            if (ggml_arm_mmid_has_custom_kernels() && ne0 % QK2_0 == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK2_0) * sizeof(block_q2_0x4);
++            }
++            return 0;
++        case GGML_TYPE_NVFP4:
++            if (ggml_arm_mmid_has_custom_kernels() && ne0 % QK_NVFP4 == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK_NVFP4) * sizeof(block_nvfp4x4);
++            }
++            return 0;
++        case GGML_TYPE_Q2_K:
++            if (ggml_arm_mmid_has_custom_kernels() && ne0 % QK_K == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK_K) * sizeof(block_q2_Kx4);
++            }
++            return 0;
++        case GGML_TYPE_IQ1_S:
++            if (mode >= 2 && ggml_arm_mmid_has_custom_kernels() && ne0 % QK_K == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK_K) * sizeof(block_iq1_sx4);
++            }
++            return 0;
++        case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_IQ2_XS:
++        case GGML_TYPE_IQ2_XXS:
++            if (mode >= 2 && ggml_arm_mmid_has_custom_kernels() && ne0 % QK_K == 0 && ne1 % 4 == 0) {
++                if (out_nb_cols) { *out_nb_cols = 4; }
++                return (size_t) (ne1 / 4) * (size_t) (ne0 / QK_K) * sizeof(block_iq2_4x4);
++            }
++            return 0;
++        default:
++            return 0;
++    }
++}
++
++void ggml_mmid_repack_slice(enum ggml_type type, int64_t ne0, int64_t ne1, void * dst, const void * src, size_t src_size) {
++    struct ggml_tensor t;
++    memset(&t, 0, sizeof(t));
++    t.type = type;
++    t.ne[0] = ne0; t.ne[1] = ne1; t.ne[2] = 1; t.ne[3] = 1;
++    t.data = dst;
++    const int inter = ggml_cpu_has_matmul_int8() ? 8 : 4;
++    switch (type) {
++        case GGML_TYPE_MXFP4:   repack_mxfp4_to_mxfp4_4_bl(&t, 4, src, src_size); break;
++        case GGML_TYPE_Q4_0:    repack_q4_0_to_q4_0_4_bl(&t, inter, src, src_size); break;
++        case GGML_TYPE_IQ4_NL:  repack_iq4_nl_to_iq4_nl_4_bl(&t, 4, src, src_size); break;
++        case GGML_TYPE_Q8_0:    repack_q8_0_to_q8_0_4_bl(&t, inter, src, src_size); break;
++        case GGML_TYPE_Q1_0:    repack_q1_0_to_q1_0_4_bl(&t, inter, src, src_size); break;
++        case GGML_TYPE_Q4_K:    repack_q4_K_to_q4_K_8_bl(&t, inter, src, src_size); break;
++        case GGML_TYPE_Q5_K:    repack_q5_K_to_q5_K_8_bl(&t, inter, src, src_size); break;
++        case GGML_TYPE_Q6_K:    repack_q6_K_to_q6_K_8_bl(&t, inter, src, src_size); break;
++        case GGML_TYPE_Q2_0:    ggml_arm_repack_q2_0_4x4(dst, src, ne0, ne1); break;
++        case GGML_TYPE_NVFP4:   ggml_arm_repack_nvfp4_4x4(dst, src, ne0, ne1); break;
++        case GGML_TYPE_Q2_K:    ggml_arm_repack_q2_K_4x4(dst, src, ne0, ne1); break;
++        case GGML_TYPE_IQ1_S:   ggml_arm_repack_iq1_s_4x4(dst, src, ne0, ne1); break;
++        case GGML_TYPE_IQ2_S:   ggml_arm_repack_iq2_s_4x4(dst, src, ne0, ne1); break;
++        case GGML_TYPE_IQ2_XS:  ggml_arm_repack_iq2_xs_4x4(dst, src, ne0, ne1); break;
++        case GGML_TYPE_IQ2_XXS: ggml_arm_repack_iq2_xxs_4x4(dst, src, ne0, ne1); break;
++        default: GGML_ABORT("unsupported ggml_mmid_repack_slice type %d", (int) type);
++    }
++}
++
++void ggml_mmid_repack_gemv(enum ggml_type type, int64_t ne0, int64_t ne1,
++                           const void * repacked_slice, int64_t ir0_start, int64_t ir0_end,
++                           const void * src1_col, float * dst_col) {
++    const int nc = (int) (ir0_end - ir0_start);
++    const bool i8mm = ggml_cpu_has_matmul_int8();
++    const char * base = (const char *) repacked_slice;
++    const size_t row_sz = ggml_row_size(type, ne0);
++    switch (type) {
++        case GGML_TYPE_MXFP4:
++            if (ggml_arm_mmid_has_custom_kernels()) {
++                ggml_arm_gemv_mxfp4_4x4_q8_0_exact((int) ne0, dst_col, base + (size_t) ir0_start * row_sz, src1_col, nc);
++            } else {
++                ggml_gemv_mxfp4_4x4_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc);
++            }
++            break;
++        case GGML_TYPE_Q4_0:
++            if (i8mm) { ggml_gemv_q4_0_4x8_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            else      { ggml_gemv_q4_0_4x4_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            break;
++        case GGML_TYPE_IQ4_NL:
++            ggml_gemv_iq4_nl_4x4_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc);
++            break;
++        case GGML_TYPE_Q8_0:
++            if (i8mm) { ggml_gemv_q8_0_4x8_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            else      { ggml_gemv_q8_0_4x4_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            break;
++        case GGML_TYPE_Q1_0:
++            if (i8mm) { ggml_gemv_q1_0_4x8_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            else      { ggml_gemv_q1_0_4x4_q8_0((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            break;
++        case GGML_TYPE_Q4_K:
++            if (i8mm) { ggml_gemv_q4_K_8x8_q8_K((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            else      { ggml_gemv_q4_K_8x4_q8_K((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            break;
++        case GGML_TYPE_Q5_K:
++            if (i8mm) { ggml_gemv_q5_K_8x8_q8_K((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            else      { ggml_gemv_q5_K_8x4_q8_K((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            break;
++        case GGML_TYPE_Q6_K:
++            if (i8mm) { ggml_gemv_q6_K_8x8_q8_K((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            else      { ggml_gemv_q6_K_8x4_q8_K((int) ne0, dst_col, (size_t) ne1, base + (size_t) ir0_start * row_sz, src1_col, 1, nc); }
++            break;
++        case GGML_TYPE_Q2_0:
++            ggml_arm_gemv_q2_0_4x4_q8_0((int) ne0, dst_col, base + (size_t) (ir0_start / 4) * (size_t) (ne0 / QK2_0) * sizeof(block_q2_0x4), src1_col, nc);
++            break;
++        case GGML_TYPE_NVFP4:
++            ggml_arm_gemv_nvfp4_4x4_q8_0((int) ne0, dst_col, base + (size_t) (ir0_start / 4) * (size_t) (ne0 / QK_NVFP4) * sizeof(block_nvfp4x4), src1_col, nc);
++            break;
++        case GGML_TYPE_Q2_K:
++            ggml_arm_gemv_q2_K_4x4_q8_K((int) ne0, dst_col, base + (size_t) (ir0_start / 4) * (size_t) (ne0 / QK_K) * sizeof(block_q2_Kx4), src1_col, nc);
++            break;
++        case GGML_TYPE_IQ1_S:
++            ggml_arm_gemv_iq1_s_4x4_q8_K((int) ne0, dst_col, base + (size_t) (ir0_start / 4) * (size_t) (ne0 / QK_K) * sizeof(block_iq1_sx4), src1_col, nc);
++            break;
++        case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_IQ2_XS:
++        case GGML_TYPE_IQ2_XXS:
++            ggml_arm_gemv_iq2_4x4_q8_K((int) ne0, dst_col, base + (size_t) (ir0_start / 4) * (size_t) (ne0 / QK_K) * sizeof(block_iq2_4x4), src1_col, nc);
++            break;
++        default:
++            GGML_ABORT("unsupported ggml_mmid_repack_gemv type %d", (int) type);
++    }
++}
++
++static int ggml_lm_head_q4_k_interleave(void) {
++    if (ggml_cpu_has_avx2()) {
++        return 8;
++    }
++    if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
++        return 8;
++    }
++    if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
++        return 4;
++    }
++    return 0;
++}
++
++static bool ggml_lm_head_q4_k_supported(const struct ggml_tensor * w) {
++    if (!w || w->type != GGML_TYPE_Q4_K || !w->buffer) {
++        return false;
++    }
++    if (w->buffer->buft != ggml_backend_cpu_repack_buffer_type()) {
++        return false;
++    }
++    if (w->ne[0] % QK_K != 0 || w->ne[1] % 8 != 0) {
++        return false;
++    }
++    return ggml_lm_head_q4_k_interleave() != 0;
++}
++
++static void ggml_lm_head_q4_k_unrepack_row(const struct ggml_tensor * w, int64_t row, void * dst_q4_k) {
++    const int bl = ggml_lm_head_q4_k_interleave();
++    GGML_ASSERT(bl == 4 || bl == 8);
++    const int64_t nblocks = w->ne[0] / QK_K;
++    const int64_t grp = row / 8;
++    const int lane = (int) (row % 8);
++    const block_q4_Kx8 * src = (const block_q4_Kx8 *) w->data + grp * nblocks;
++    block_q4_K * out = (block_q4_K *) dst_q4_k;
++    const int chunks = (QK_K / 2) / bl;
++
++    for (int64_t x = 0; x < nblocks; ++x) {
++        out[x].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d    = src[x].d[lane];
++        out[x].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin = src[x].dmin[lane];
++        for (int c = 0; c < chunks; ++c) {
++            memcpy(&out[x].qs[c * bl], &src[x].qs[(c * 8 + lane) * bl], (size_t) bl);
++        }
++        for (int i = 0; i < 4; ++i) {
++            uint8_t s_lo, m_lo, s_hi, m_hi;
++            const uint8_t * sc0 = &src[x].scales[i * 12];
++            const uint8_t * sc1 = &src[x].scales[48 + i * 12];
++            if (lane < 4) {
++                s_lo = sc0[lane] & 63;
++                m_lo = sc0[4 + lane] & 63;
++                s_hi = sc1[lane] & 63;
++                m_hi = sc1[4 + lane] & 63;
++            } else {
++                const int l = lane - 4;
++                s_lo = ((sc0[l] & 192) >> 2) | (sc0[8 + l] & 15);
++                m_lo = ((sc0[4 + l] & 192) >> 2) | ((sc0[8 + l] & 240) >> 4);
++                s_hi = ((sc1[l] & 192) >> 2) | (sc1[8 + l] & 15);
++                m_hi = ((sc1[4 + l] & 192) >> 2) | ((sc1[8 + l] & 240) >> 4);
++            }
++            out[x].scales[i]     = (s_lo & 63) | ((s_hi & 48) << 2);
++            out[x].scales[i + 4] = (m_lo & 63) | ((m_hi & 48) << 2);
++            out[x].scales[i + 8] = (s_hi & 15) | ((m_hi & 15) << 4);
++        }
++    }
++}
++
++static void ggml_lm_head_q4_k_repack_rows(int64_t ne0, int64_t n_rows, const void * src_q4_k, void * dst_repacked) {
++    const int bl = ggml_lm_head_q4_k_interleave();
++    GGML_ASSERT((bl == 4 || bl == 8) && (n_rows % 8 == 0));
++    struct ggml_tensor t;
++    memset(&t, 0, sizeof(t));
++    t.type  = GGML_TYPE_Q4_K;
++    t.ne[0] = ne0;
++    t.ne[1] = n_rows;
++    t.ne[2] = 1;
++    t.ne[3] = 1;
++    t.data  = dst_repacked;
++    const size_t data_size = (size_t) n_rows * ggml_row_size(GGML_TYPE_Q4_K, ne0);
++    const int rc = repack_q4_K_to_q4_K_8_bl(&t, bl, src_q4_k, data_size);
++    GGML_ASSERT(rc == 0);
++}
++
++static void ggml_lm_head_q4_k_quantize_h(int64_t ne0, const float * h_f32, void * dst_q8_k) {
++    ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float(h_f32, dst_q8_k, ne0);
++}
++
++static void ggml_lm_head_q8_k_dequant(int64_t ne0, const void * src_q8_k, float * dst_f32) {
++    const int64_t nb = ne0 / QK_K;
++    const block_q8_K * b = (const block_q8_K *) src_q8_k;
++    for (int64_t i = 0; i < nb; ++i) {
++        const float d = b[i].d;
++        for (int j = 0; j < QK_K; ++j) {
++            dst_f32[i * QK_K + j] = d * (float) b[i].qs[j];
++        }
++    }
++}
++
++static void ggml_lm_head_q4_k_gemv_rows(int64_t ne0, int64_t total_rows, const void * repacked_w,
++                                        int64_t row_start, int64_t n_rows, const void * src_q8_k, float * dst) {
++    GGML_ASSERT((row_start % 8 == 0) && (n_rows % 8 == 0));
++    const int bl = ggml_lm_head_q4_k_interleave();
++    const size_t row_sz = ggml_row_size(GGML_TYPE_Q4_K, ne0);
++    const char * base = (const char *) repacked_w + (size_t) row_start * row_sz;
++    if (bl == 8) {
++        ggml_gemv_q4_K_8x8_q8_K((int) ne0, dst, (size_t) total_rows, base, src_q8_k, 1, (int) n_rows);
++    } else {
++        ggml_gemv_q4_K_8x4_q8_K((int) ne0, dst, (size_t) total_rows, base, src_q8_k, 1, (int) n_rows);
++    }
++}
++
++const struct ggml_cpu_lm_head_ops * ggml_cpu_lm_head_get_ops(void) {
++    static const struct ggml_cpu_lm_head_ops ops = {
++        /* .q4_k_repack_supported = */ ggml_lm_head_q4_k_supported,
++        /* .q4_k_unrepack_row     = */ ggml_lm_head_q4_k_unrepack_row,
++        /* .q4_k_repack_rows      = */ ggml_lm_head_q4_k_repack_rows,
++        /* .q4_k_quantize_h       = */ ggml_lm_head_q4_k_quantize_h,
++        /* .q8_k_dequant          = */ ggml_lm_head_q8_k_dequant,
++        /* .q4_k_gemv_rows        = */ ggml_lm_head_q4_k_gemv_rows,
++    };
++    return &ops;
++}
++
++} // extern "C"
+diff --git a/ggml/src/ggml-cpu/repack.h b/ggml/src/ggml-cpu/repack.h
+index fc6715c..0c578c0 100644
+--- a/ggml/src/ggml-cpu/repack.h
++++ b/ggml/src/ggml-cpu/repack.h
+@@ -138,6 +138,40 @@ struct block_mxfp4x8 {
+ };
+ static_assert(sizeof(block_mxfp4x8) == 8 + QK_MXFP4 * 4, "wrong mxfp4x8 block size/padding");
+ 
++struct block_q2_0x4 {
++    ggml_half d[4];
++    uint8_t   qs[QK2_0];
++};
++static_assert(sizeof(block_q2_0x4) == 4 * sizeof(block_q2_0), "wrong q2_0x4 block size/padding");
++
++struct block_nvfp4x4 {
++    uint8_t d[16];
++    uint8_t qs[QK_NVFP4 * 2];
++};
++static_assert(sizeof(block_nvfp4x4) == 4 * sizeof(block_nvfp4), "wrong nvfp4x4 block size/padding");
++
++struct block_q2_Kx4 {
++    ggml_half d[4];
++    ggml_half dmin[4];
++    uint8_t   scales[QK_K / 16 * 4];
++    uint8_t   qs[QK_K / 4 * 4];
++};
++static_assert(sizeof(block_q2_Kx4) == 4 * sizeof(block_q2_K), "wrong q2_Kx4 block size/padding");
++
++struct block_iq1_sx4 {
++    ggml_half d[4];
++    int8_t    ls_sgn[32];
++    uint8_t   qs[QK_K];
++};
++static_assert(sizeof(block_iq1_sx4) == 4 * sizeof(ggml_half) + 32 + QK_K, "wrong iq1_sx4 block size/padding");
++
++struct block_iq2_4x4 {
++    ggml_half d[4];
++    uint8_t   scales[32];
++    uint8_t   qs[QK_K * 2];
++};
++static_assert(sizeof(block_iq2_4x4) == 4 * sizeof(ggml_half) + 32 + QK_K * 2, "wrong iq2_4x4 block size/padding");
++
+ #if defined(__cplusplus)
+ extern "C" {
+ #endif
+@@ -238,6 +272,21 @@ void ggml_gemm_mxfp4_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+ void ggml_gemm_mxfp4_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q8_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q8_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++// mmid expert cache 4x4 ARM NEON repack + gemv helpers
++bool ggml_arm_mmid_has_custom_kernels(void);
++void ggml_arm_repack_q2_0_4x4(void * GGML_RESTRICT dst, const void * GGML_RESTRICT src, int64_t ne0, int64_t ne1);
++void ggml_arm_repack_nvfp4_4x4(void * GGML_RESTRICT dst, const void * GGML_RESTRICT src, int64_t ne0, int64_t ne1);
++void ggml_arm_repack_q2_K_4x4(void * GGML_RESTRICT dst, const void * GGML_RESTRICT src, int64_t ne0, int64_t ne1);
++void ggml_arm_repack_iq1_s_4x4(void * GGML_RESTRICT dst, const void * GGML_RESTRICT src, int64_t ne0, int64_t ne1);
++void ggml_arm_repack_iq2_s_4x4(void * GGML_RESTRICT dst, const void * GGML_RESTRICT src, int64_t ne0, int64_t ne1);
++void ggml_arm_repack_iq2_xs_4x4(void * GGML_RESTRICT dst, const void * GGML_RESTRICT src, int64_t ne0, int64_t ne1);
++void ggml_arm_repack_iq2_xxs_4x4(void * GGML_RESTRICT dst, const void * GGML_RESTRICT src, int64_t ne0, int64_t ne1);
++void ggml_arm_gemv_q2_0_4x4_q8_0(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc);
++void ggml_arm_gemv_nvfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc);
++void ggml_arm_gemv_mxfp4_4x4_q8_0_exact(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc);
++void ggml_arm_gemv_q2_K_4x4_q8_K(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc);
++void ggml_arm_gemv_iq1_s_4x4_q8_K(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc);
++void ggml_arm_gemv_iq2_4x4_q8_K(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc);
+ #if defined __riscv_zvfh
+ void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
+ void ggml_quantize_mat_q8_K_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index 9ff7335..d51677d 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -1,6 +1,7 @@
+ #include "vec.h"
+ 
+ #include <cassert>
++#include <cstdlib>
+ 
+ // precomputed gelu table for f16 (128 KB)
+ ggml_fp16_t ggml_table_gelu_f16[1 << 16];
+@@ -252,6 +253,33 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t *
+         }
+         GGML_F32x4_REDUCE_4(sumf, sum[0], sum[1], sum[2], sum[3]);
+     }
++#elif defined(__aarch64__) && defined(__ARM_NEON)
++    static const bool use_neon = []() {
++        const char * e = getenv("GGML_BF16_NEON");
++        return e && e[0] != '\0' && e[0] != '0';
++    }();
++    if (use_neon) {
++        float64x2_t acc0 = vdupq_n_f64(0.0);
++        float64x2_t acc1 = vdupq_n_f64(0.0);
++        float64x2_t acc2 = vdupq_n_f64(0.0);
++        float64x2_t acc3 = vdupq_n_f64(0.0);
++        for (; i + 8 <= n; i += 8) {
++            uint16x8_t vx = vld1q_u16((const uint16_t *) (x + i));
++            uint16x8_t vy = vld1q_u16((const uint16_t *) (y + i));
++            float32x4_t x0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(vx), 16));
++            float32x4_t x1 = vreinterpretq_f32_u32(vshll_high_n_u16(vx, 16));
++            float32x4_t y0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(vy), 16));
++            float32x4_t y1 = vreinterpretq_f32_u32(vshll_high_n_u16(vy, 16));
++            float32x4_t p0 = vmulq_f32(x0, y0);
++            float32x4_t p1 = vmulq_f32(x1, y1);
++            acc0 = vaddq_f64(acc0, vcvt_f64_f32(vget_low_f32(p0)));
++            acc1 = vaddq_f64(acc1, vcvt_high_f64_f32(p0));
++            acc2 = vaddq_f64(acc2, vcvt_f64_f32(vget_low_f32(p1)));
++            acc3 = vaddq_f64(acc3, vcvt_high_f64_f32(p1));
++        }
++        float64x2_t acc = vaddq_f64(vaddq_f64(acc0, acc1), vaddq_f64(acc2, acc3));
++        sumf += (ggml_float) vaddvq_f64(acc);
++    }
+ #endif
+ 
+     for (; i < n; ++i) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index b47c5ad..5f5dfeb 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -8140,3 +8140,170 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
+     if (p0->strict_cpu != p1->strict_cpu ) return false;
+     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
+ }
++
++
++// File-mapping registry (sage-lab, inkling-phone): lets a backend turn a pointer into a memory-mapped model file
++// back into (fd, offset), to read ranges with pread instead of page faults. Registered by llama_mmap.
++#if defined(__APPLE__) || defined(__linux__)
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/uio.h>
++#include <unistd.h>
++#endif
++#define GGML_FILE_MAP_MAX 16
++static struct { const char * addr; size_t size; int fd; } ggml_file_maps[GGML_FILE_MAP_MAX];
++static int ggml_n_file_maps = 0;
++
++void ggml_file_map_register(const void * addr, size_t size, int fd) {
++    if (ggml_n_file_maps >= GGML_FILE_MAP_MAX) { return; }
++    int own = -1;
++#if defined(__APPLE__)
++    char path[1024];
++    if (fcntl(fd, F_GETPATH, path) == 0) {
++        own = open(path, O_RDONLY);
++        if (own >= 0) { fcntl(own, F_NOCACHE, 1); } // direct reads: keep the OS file cache out of the way
++    }
++#elif defined(__linux__)
++    own = dup(fd);
++#else
++    (void) fd;
++#endif
++    if (own < 0) { return; }
++    ggml_file_maps[ggml_n_file_maps].addr = (const char *) addr;
++    ggml_file_maps[ggml_n_file_maps].size = size;
++    ggml_file_maps[ggml_n_file_maps].fd   = own;
++    ggml_n_file_maps++;
++}
++
++bool ggml_file_map_read(const void * ptr, void * dst, size_t size) {
++#if defined(__APPLE__) || defined(__linux__)
++    const char * p = (const char *) ptr;
++    for (int i = 0; i < ggml_n_file_maps; i++) {
++        if (p >= ggml_file_maps[i].addr && p + size <= ggml_file_maps[i].addr + ggml_file_maps[i].size) {
++            size_t done = 0;
++            while (done < size) {
++                const ssize_t n = pread(ggml_file_maps[i].fd, (char *) dst + done, size - done, (off_t) (p - ggml_file_maps[i].addr) + done);
++                if (n <= 0) { return false; }
++                done += (size_t) n;
++            }
++            return true;
++        }
++    }
++#else
++    (void) ptr; (void) dst; (void) size;
++#endif
++    return false;
++}
++
++// adapted from Atomic Engine src/llama-expert-source.cpp (read_experts, adjacent layout): consecutive slices straight
++// into each destination with preadv; a short read advances the vectors and the offset
++bool ggml_file_map_readv(const void * ptr, void * const * dst, const size_t * size, int n) {
++#if defined(__APPLE__) || defined(__linux__)
++    if (n < 1 || n > 16) { return false; }
++    size_t total = 0;
++    struct iovec vectors[16];
++    for (int i = 0; i < n; i++) { vectors[i].iov_base = dst[i]; vectors[i].iov_len = size[i]; total += size[i]; }
++    const char * p = (const char *) ptr;
++    for (int m = 0; m < ggml_n_file_maps; m++) {
++        if (p >= ggml_file_maps[m].addr && p + total <= ggml_file_maps[m].addr + ggml_file_maps[m].size) {
++            off_t offset = (off_t) (p - ggml_file_maps[m].addr);
++            for (int i = 0; i < n;) {
++                const ssize_t bytes = preadv(ggml_file_maps[m].fd, vectors + i, n - i, offset);
++                if (bytes < 0 && errno == EINTR) { continue; }
++                if (bytes <= 0) { return false; }
++                offset += bytes;
++                size_t done = (size_t) bytes;
++                while (i < n && done >= vectors[i].iov_len) { done -= vectors[i].iov_len; ++i; }
++                if (i < n && done) {
++                    vectors[i].iov_base = (char *) vectors[i].iov_base + done;
++                    vectors[i].iov_len -= done;
++                }
++            }
++            return true;
++        }
++    }
++#else
++    (void) ptr; (void) dst; (void) size; (void) n;
++#endif
++    return false;
++}
++
++// expert matmul pairs (gate_up -> down), written at graph build, read by the CPU backend
++#define GGML_MMID_PAIR_MAX 64
++static struct {
++    const void * gate_up; const char * down; size_t down_nb2;
++    enum ggml_type down_type; int64_t down_ne0; int64_t down_ne1;
++} ggml_mmid_pairs[GGML_MMID_PAIR_MAX];
++static int ggml_n_mmid_pairs = 0;
++
++void ggml_mmid_register_pair(const struct ggml_tensor * gate_up, const struct ggml_tensor * down) {
++    if (!gate_up || !down || !gate_up->data || !down->data || gate_up->ne[2] != down->ne[2]) { return; }
++    for (int i = 0; i < ggml_n_mmid_pairs; i++) {
++        if (ggml_mmid_pairs[i].gate_up == gate_up->data) { return; }
++    }
++    if (ggml_n_mmid_pairs >= GGML_MMID_PAIR_MAX) { return; }
++    ggml_mmid_pairs[ggml_n_mmid_pairs].gate_up   = gate_up->data;
++    ggml_mmid_pairs[ggml_n_mmid_pairs].down      = (const char *) down->data;
++    ggml_mmid_pairs[ggml_n_mmid_pairs].down_nb2  = down->nb[2];
++    ggml_mmid_pairs[ggml_n_mmid_pairs].down_type = down->type;
++    ggml_mmid_pairs[ggml_n_mmid_pairs].down_ne0  = down->ne[0];
++    ggml_mmid_pairs[ggml_n_mmid_pairs].down_ne1  = down->ne[1];
++    ggml_n_mmid_pairs++;
++}
++
++bool ggml_mmid_get_pair(const void * gate_up_data, const char ** down_data, size_t * down_nb2) {
++    for (int i = 0; i < ggml_n_mmid_pairs; i++) {
++        if (ggml_mmid_pairs[i].gate_up == gate_up_data) {
++            *down_data = ggml_mmid_pairs[i].down; *down_nb2 = ggml_mmid_pairs[i].down_nb2;
++            return true;
++        }
++    }
++    return false;
++}
++
++bool ggml_mmid_get_pair_meta(const void * gate_up_data, const char ** down_data, size_t * down_nb2,
++                             enum ggml_type * down_type, int64_t * down_ne0, int64_t * down_ne1) {
++    for (int i = 0; i < ggml_n_mmid_pairs; i++) {
++        if (ggml_mmid_pairs[i].gate_up == gate_up_data) {
++            *down_data = ggml_mmid_pairs[i].down; *down_nb2 = ggml_mmid_pairs[i].down_nb2;
++            *down_type = ggml_mmid_pairs[i].down_type; *down_ne0 = ggml_mmid_pairs[i].down_ne0; *down_ne1 = ggml_mmid_pairs[i].down_ne1;
++            return true;
++        }
++    }
++    return false;
++}
++
++#define GGML_MMID_ROUTER_MAX 128
++static struct {
++    const struct ggml_tensor * dst;
++    const char * gate_up;
++    size_t gate_up_nb2;
++} ggml_mmid_routers[GGML_MMID_ROUTER_MAX];
++static int ggml_mmid_router_head = 0;
++static int ggml_n_mmid_routers = 0;
++
++void ggml_mmid_register_router(const struct ggml_tensor * argsort_dst, const struct ggml_tensor * gate_up) {
++    if (!argsort_dst || !gate_up || !gate_up->data) { return; }
++    for (int i = 0; i < ggml_n_mmid_routers; i++) {
++        if (ggml_mmid_routers[i].dst == argsort_dst) {
++            ggml_mmid_routers[i].gate_up = (const char *) gate_up->data;
++            ggml_mmid_routers[i].gate_up_nb2 = gate_up->nb[2];
++            return;
++        }
++    }
++    int slot = ggml_n_mmid_routers < GGML_MMID_ROUTER_MAX ? ggml_n_mmid_routers++ : (ggml_mmid_router_head++ % GGML_MMID_ROUTER_MAX);
++    ggml_mmid_routers[slot].dst = argsort_dst;
++    ggml_mmid_routers[slot].gate_up = (const char *) gate_up->data;
++    ggml_mmid_routers[slot].gate_up_nb2 = gate_up->nb[2];
++}
++
++bool ggml_mmid_get_router(const struct ggml_tensor * argsort_dst, const char ** gate_up_data, size_t * gate_up_nb2) {
++    for (int i = 0; i < ggml_n_mmid_routers; i++) {
++        if (ggml_mmid_routers[i].dst == argsort_dst) {
++            *gate_up_data = ggml_mmid_routers[i].gate_up;
++            *gate_up_nb2 = ggml_mmid_routers[i].gate_up_nb2;
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/include/llama.h b/include/llama.h
+index 7122143..b2ba6a8 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1147,6 +1147,11 @@ extern "C" {
+     // returns NULL for invalid ids.
+     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+ 
++    // Opt in to greedy-only LM head evaluation (for LLAMA_LM_HEAD_SHORTLIST, default off).
++    // When enabled, callers read the greedy argmax token via llama_get_greedy_token_ith().
++    LLAMA_API void        llama_set_greedy_head(struct llama_context * ctx, bool value);
++    LLAMA_API llama_token llama_get_greedy_token_ith(struct llama_context * ctx, int32_t i);
++
+     // Get all output token embeddings.
+     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
+     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7490cf3..d837321 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-context.h"
+ 
+ #include "ggml.h"
++#include "ggml-cpu.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-impl.h"
+@@ -17,10 +18,16 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <condition_variable>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <functional>
+ #include <limits>
++#include <mutex>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ 
+ //
+@@ -160,6 +167,579 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+ 
++// Opt-in greedy LM-head shortlist with provably exact certificate + fallback (LLAMA_LM_HEAD_SHORTLIST).
++struct llama_lm_head_shortlist {
++    enum mode_t {
++        MODE_OFF = 0,
++        MODE_EXACT_NORM = 1,
++        MODE_EXACT_CLUSTER = 2,
++        MODE_LOSSY_PURE = 3,
++        MODE_LOSSY_MARGIN = 4,
++    };
++
++    struct worker_pool {
++        std::vector<std::thread> workers;
++        std::mutex mtx;
++        std::condition_variable cv_start;
++        std::condition_variable cv_done;
++        const std::function<void(int, int)> * cur_fn = nullptr;
++        int cur_nth = 1;
++        uint64_t gen = 0;
++        int done = 0;
++        bool stop = false;
++
++        ~worker_pool() { shutdown(); }
++
++        void shutdown() {
++            {
++                std::lock_guard<std::mutex> lk(mtx);
++                stop = true;
++                gen++;
++            }
++            cv_start.notify_all();
++            for (auto & th : workers) {
++                if (th.joinable()) th.join();
++            }
++            workers.clear();
++            stop = false;
++        }
++
++        void ensure(int nth) {
++            const int want = std::max(0, nth - 1);
++            if ((int) workers.size() == want) return;
++            shutdown();
++            for (int w = 0; w < want; ++w) {
++                const int tid = w + 1;
++                workers.emplace_back([this, tid]() {
++                    uint64_t seen = 0;
++                    for (;;) {
++                        const std::function<void(int, int)> * fn = nullptr;
++                        int nth_run = 1;
++                        {
++                            std::unique_lock<std::mutex> lk(mtx);
++                            cv_start.wait(lk, [&]() { return gen != seen; });
++                            seen = gen;
++                            if (stop) return;
++                            fn = cur_fn;
++                            nth_run = cur_nth;
++                        }
++                        if (tid < nth_run && fn) {
++                            (*fn)(tid, nth_run);
++                        }
++                        {
++                            std::lock_guard<std::mutex> lk(mtx);
++                            done++;
++                            if (done == (int) workers.size()) {
++                                cv_done.notify_one();
++                            }
++                        }
++                    }
++                });
++            }
++        }
++
++        void run(int nth, const std::function<void(int, int)> & fn) {
++            if (nth <= 1) {
++                fn(0, 1);
++                return;
++            }
++            ensure(nth);
++            {
++                std::lock_guard<std::mutex> lk(mtx);
++                cur_fn  = &fn;
++                cur_nth = nth;
++                done    = 0;
++                gen++;
++            }
++            cv_start.notify_all();
++            fn(0, nth);
++            {
++                std::unique_lock<std::mutex> lk(mtx);
++                cv_done.wait(lk, [&]() { return done == (int) workers.size(); });
++            }
++        }
++    };
++
++    mode_t mode = MODE_OFF;
++    const ggml_cpu_lm_head_ops * ops = nullptr;
++    const ggml_tensor * w = nullptr;
++    int64_t ne0 = 0;
++    int64_t n_vocab = 0;
++    int64_t n_vocab_padded = 0;
++    float softcap = 0.0f;
++    float inv_softcap = 0.0f;
++    float lossy_logit_th = 26.0f;
++    float lossy_margin_th = 1.0f;
++    bool print_stats = false;
++
++    std::vector<llama_token> sl_ids;
++    std::vector<uint8_t>     sl_repacked;
++    std::vector<float>       sl_logits;
++    std::vector<float>       full_logits;
++    std::vector<uint8_t>     h_q8_k;
++    std::vector<float>       h_deq;
++
++    // exact certificate data
++    std::vector<double> w_mean;
++    double max_r_non_sl = 0.0;
++    int n_clusters = 0;
++    std::vector<float>  cl_centroids; // [n_clusters * ne0], centered around w_mean
++    std::vector<double> cl_radii;     // [n_clusters], exact max residual norm + fp safety
++    std::vector<int>    cl_counts;
++
++    worker_pool pool;
++
++    // stats
++    uint64_t n_calls = 0;
++    uint64_t n_skip = 0;
++    uint64_t n_fallback = 0;
++    double   sl_us = 0.0;
++    double   cert_us = 0.0;
++    double   fb_us = 0.0;
++    double   min_ub_excess = 1e30;
++
++    static const char * mode_name(mode_t m) {
++        switch (m) {
++            case MODE_EXACT_NORM:    return "exact_norm";
++            case MODE_EXACT_CLUSTER: return "exact_cluster";
++            case MODE_LOSSY_PURE:    return "lossy";
++            case MODE_LOSSY_MARGIN:  return "lossy_margin";
++            default:                 return "off";
++        }
++    }
++
++    static mode_t parse_env_mode() {
++        const char * v = getenv("LLAMA_LM_HEAD_SHORTLIST");
++        if (!v || !v[0] || strcmp(v, "0") == 0 || strcmp(v, "off") == 0) {
++            return MODE_OFF;
++        }
++        if (strcmp(v, "1") == 0 || strcmp(v, "exact") == 0 || strcmp(v, "norm") == 0) {
++            return MODE_EXACT_NORM;
++        }
++        if (strcmp(v, "cluster") == 0) {
++            return MODE_EXACT_CLUSTER;
++        }
++        if (strcmp(v, "lossy") == 0) {
++            return MODE_LOSSY_PURE;
++        }
++        if (strcmp(v, "lossy_margin") == 0) {
++            return MODE_LOSSY_MARGIN;
++        }
++        LLAMA_LOG_WARN("%s: unknown LLAMA_LM_HEAD_SHORTLIST='%s', disabling\n", __func__, v);
++        return MODE_OFF;
++    }
++
++    inline float apply_softcap(float x) const {
++        return softcap != 0.0f ? softcap * tanhf(x * inv_softcap) : x;
++    }
++
++    ~llama_lm_head_shortlist() {
++        pool.shutdown();
++        if (print_stats && n_calls > 0) {
++            const double tot_ms = (sl_us + cert_us + fb_us) / 1000.0;
++            const double fb_pct = 100.0 * (double) n_fallback / (double) n_calls;
++            fprintf(stderr,
++                "[head] mode=%s K=%zu vocab=%lld calls=%llu skip=%llu fallback=%llu fb_rate=%.2f%% "
++                "head_ms=%.2f (sl_ms=%.2f cert_ms=%.2f fb_ms=%.2f) avg_ms=%.3f min_ub_excess=%.3f\n",
++                mode_name(mode), sl_ids.size(), (long long) n_vocab,
++                (unsigned long long) n_calls, (unsigned long long) n_skip, (unsigned long long) n_fallback,
++                fb_pct, tot_ms, sl_us / 1000.0, cert_us / 1000.0, fb_us / 1000.0,
++                tot_ms / (double) n_calls, min_ub_excess < 1e20 ? min_ub_excess : 0.0);
++            fflush(stderr);
++        }
++    }
++
++    bool init(const ggml_cpu_lm_head_ops * ops_in, const ggml_tensor * w_in, int64_t n_vocab_in, float softcap_in, int n_threads) {
++        mode = parse_env_mode();
++        if (mode == MODE_OFF) {
++            return false;
++        }
++        if (!ops_in || !ops_in->q4_k_repack_supported(w_in)) {
++            LLAMA_LOG_WARN("%s: output.weight is not Q4_K CPU_REPACK, disabling shortlist\n", __func__);
++            return false;
++        }
++
++        ops            = ops_in;
++        w              = w_in;
++        ne0            = w->ne[0];
++        n_vocab_padded = w->ne[1];
++        n_vocab        = std::min<int64_t>(n_vocab_in, n_vocab_padded);
++        softcap        = softcap_in;
++        inv_softcap    = softcap != 0.0f ? 1.0f / softcap : 0.0f;
++
++        if (const char * s = getenv("LLAMA_LM_HEAD_STATS")) {
++            print_stats = atoi(s) != 0;
++        }
++        if (const char * s = getenv("LLAMA_LM_HEAD_LOSSY_LOGIT")) {
++            lossy_logit_th = (float) atof(s);
++        }
++        if (const char * s = getenv("LLAMA_LM_HEAD_LOSSY_MARGIN")) {
++            lossy_margin_th = (float) atof(s);
++        }
++
++        int64_t k_req = 8192;
++        if (const char * s = getenv("LLAMA_LM_HEAD_SHORTLIST_K")) {
++            k_req = std::max<int64_t>(8, atoi(s));
++        }
++        const int64_t max_sl = (n_vocab / 8) * 8;
++        k_req = std::min<int64_t>((k_req + 7) & ~7LL, max_sl);
++
++        std::vector<uint8_t> in_sl((size_t) n_vocab, 0);
++        sl_ids.reserve((size_t) k_req);
++        if (const char * path = getenv("LLAMA_LM_HEAD_SHORTLIST_FILE")) {
++            std::ifstream f(path);
++            if (!f) {
++                LLAMA_LOG_WARN("%s: failed to open LLAMA_LM_HEAD_SHORTLIST_FILE='%s', falling back to 0..K-1\n", __func__, path);
++            } else {
++                int64_t tid = 0;
++                while ((int64_t) sl_ids.size() < k_req && (f >> tid)) {
++                    if (tid >= 0 && tid < n_vocab && !in_sl[(size_t) tid]) {
++                        in_sl[(size_t) tid] = 1;
++                        sl_ids.push_back((llama_token) tid);
++                    }
++                }
++            }
++        }
++        for (int64_t tid = 0; (int64_t) sl_ids.size() < k_req && tid < n_vocab; ++tid) {
++            if (!in_sl[(size_t) tid]) {
++                in_sl[(size_t) tid] = 1;
++                sl_ids.push_back((llama_token) tid);
++            }
++        }
++        // ensure exact multiple of 8
++        sl_ids.resize(sl_ids.size() & ~(size_t) 7);
++        if (sl_ids.empty()) {
++            return false;
++        }
++
++        const int64_t t0 = ggml_time_us();
++        const size_t row_sz = ggml_row_size(GGML_TYPE_Q4_K, ne0);
++        std::vector<uint8_t> sl_raw(sl_ids.size() * row_sz);
++        for (size_t i = 0; i < sl_ids.size(); ++i) {
++            ops->q4_k_unrepack_row(w, sl_ids[i], sl_raw.data() + i * row_sz);
++        }
++        sl_repacked.resize(sl_ids.size() * row_sz);
++        ops->q4_k_repack_rows(ne0, (int64_t) sl_ids.size(), sl_raw.data(), sl_repacked.data());
++        sl_raw.clear();
++        sl_raw.shrink_to_fit();
++
++        sl_logits.resize(sl_ids.size());
++        full_logits.resize((size_t) n_vocab_padded);
++        h_q8_k.resize(ggml_row_size(GGML_TYPE_Q8_K, ne0));
++        h_deq.resize((size_t) ne0);
++
++        if (mode == MODE_EXACT_NORM || mode == MODE_EXACT_CLUSTER) {
++            const auto * q4_traits = ggml_get_type_traits(GGML_TYPE_Q4_K);
++            const double eps_fp = 1e-4; // conservative bound on 81 F32 FMAs in q4_K_8x{8,4}
++            w_mean.assign((size_t) ne0, 0.0);
++
++            std::vector<uint8_t> tmp_q4(row_sz);
++            std::vector<float>   tmp_f((size_t) ne0);
++            int64_t n_non_sl = 0;
++            for (int64_t r = 0; r < n_vocab; ++r) {
++                if (in_sl[(size_t) r]) continue;
++                ops->q4_k_unrepack_row(w, r, tmp_q4.data());
++                q4_traits->to_float(tmp_q4.data(), tmp_f.data(), ne0);
++                for (int64_t j = 0; j < ne0; ++j) {
++                    w_mean[(size_t) j] += (double) tmp_f[(size_t) j];
++                }
++                n_non_sl++;
++            }
++            if (n_non_sl > 0) {
++                const double inv = 1.0 / (double) n_non_sl;
++                for (int64_t j = 0; j < ne0; ++j) {
++                    w_mean[(size_t) j] *= inv;
++                }
++            }
++
++            if (mode == MODE_EXACT_NORM) {
++                max_r_non_sl = 0.0;
++                for (int64_t r = 0; r < n_vocab; ++r) {
++                    if (in_sl[(size_t) r]) continue;
++                    ops->q4_k_unrepack_row(w, r, tmp_q4.data());
++                    q4_traits->to_float(tmp_q4.data(), tmp_f.data(), ne0);
++                    double c2 = 0.0, w2 = 0.0;
++                    for (int64_t j = 0; j < ne0; ++j) {
++                        const double x = (double) tmp_f[(size_t) j];
++                        const double d = x - w_mean[(size_t) j];
++                        c2 += d * d;
++                        w2 += x * x;
++                    }
++                    const double bound_r = sqrt(c2) + eps_fp * sqrt(w2);
++                    if (bound_r > max_r_non_sl) max_r_non_sl = bound_r;
++                }
++            } else {
++                n_clusters = 64;
++                if (const char * s = getenv("LLAMA_LM_HEAD_CLUSTERS")) {
++                    n_clusters = std::max(1, std::min(1024, atoi(s)));
++                }
++                cl_centroids.assign((size_t) n_clusters * (size_t) ne0, 0.0f);
++                // deterministic strided init from non-shortlist rows
++                const int64_t stride = std::max<int64_t>(1, n_non_sl / n_clusters);
++                int64_t seen = 0;
++                int picked = 0;
++                for (int64_t r = 0; r < n_vocab && picked < n_clusters; ++r) {
++                    if (in_sl[(size_t) r]) continue;
++                    if (seen % stride == 0) {
++                        ops->q4_k_unrepack_row(w, r, tmp_q4.data());
++                        q4_traits->to_float(tmp_q4.data(), tmp_f.data(), ne0);
++                        float * dst_c = cl_centroids.data() + (size_t) picked * (size_t) ne0;
++                        for (int64_t j = 0; j < ne0; ++j) {
++                            dst_c[j] = (float) ((double) tmp_f[(size_t) j] - w_mean[(size_t) j]);
++                        }
++                        picked++;
++                    }
++                    seen++;
++                }
++                n_clusters = picked;
++                const int nth = std::max(1, n_threads);
++
++                // 1 k-means centroid update pass (parallel)
++                std::vector<float> c_norm2((size_t) n_clusters, 0.0f);
++                for (int k = 0; k < n_clusters; ++k) {
++                    const float * c = cl_centroids.data() + (size_t) k * (size_t) ne0;
++                    double s = 0.0;
++                    for (int64_t j = 0; j < ne0; ++j) s += (double) c[j] * (double) c[j];
++                    c_norm2[(size_t) k] = (float) s;
++                }
++                std::vector<std::vector<double>> thr_sums((size_t) nth, std::vector<double>((size_t) n_clusters * (size_t) ne0, 0.0));
++                std::vector<std::vector<int>>    thr_cnts((size_t) nth, std::vector<int>((size_t) n_clusters, 0));
++                pool.run(nth, [&](int tid, int nt) {
++                    const int64_t r0 = (n_vocab * tid) / nt;
++                    const int64_t r1 = (n_vocab * (tid + 1)) / nt;
++                    std::vector<uint8_t> lq4(row_sz);
++                    std::vector<float>   lf((size_t) ne0);
++                    auto & sums = thr_sums[(size_t) tid];
++                    auto & cnts = thr_cnts[(size_t) tid];
++                    for (int64_t r = r0; r < r1; ++r) {
++                        if (in_sl[(size_t) r]) continue;
++                        ops->q4_k_unrepack_row(w, r, lq4.data());
++                        q4_traits->to_float(lq4.data(), lf.data(), ne0);
++                        for (int64_t j = 0; j < ne0; ++j) lf[(size_t) j] -= (float) w_mean[(size_t) j];
++                        int best_k = 0;
++                        float best_sc = -1e30f;
++                        for (int k = 0; k < n_clusters; ++k) {
++                            const float * c = cl_centroids.data() + (size_t) k * (size_t) ne0;
++                            float dot = 0.0f;
++                            for (int64_t j = 0; j < ne0; ++j) dot += lf[(size_t) j] * c[j];
++                            const float sc = 2.0f * dot - c_norm2[(size_t) k];
++                            if (sc > best_sc) { best_sc = sc; best_k = k; }
++                        }
++                        cnts[(size_t) best_k]++;
++                        double * dst_s = sums.data() + (size_t) best_k * (size_t) ne0;
++                        for (int64_t j = 0; j < ne0; ++j) dst_s[j] += (double) lf[(size_t) j];
++                    }
++                });
++                for (int k = 0; k < n_clusters; ++k) {
++                    int tot = 0;
++                    for (int t = 0; t < nth; ++t) tot += thr_cnts[(size_t) t][(size_t) k];
++                    if (tot > 0) {
++                        float * dst_c = cl_centroids.data() + (size_t) k * (size_t) ne0;
++                        const double inv = 1.0 / (double) tot;
++                        for (int64_t j = 0; j < ne0; ++j) {
++                            double s = 0.0;
++                            for (int t = 0; t < nth; ++t) s += thr_sums[(size_t) t][(size_t) k * (size_t) ne0 + (size_t) j];
++                            dst_c[j] = (float) (s * inv);
++                        }
++                    }
++                }
++                for (int k = 0; k < n_clusters; ++k) {
++                    const float * c = cl_centroids.data() + (size_t) k * (size_t) ne0;
++                    double s = 0.0;
++                    for (int64_t j = 0; j < ne0; ++j) s += (double) c[j] * (double) c[j];
++                    c_norm2[(size_t) k] = (float) s;
++                }
++
++                // exact radius pass: every non-shortlist row covered by its assigned cluster's max radius
++                cl_radii.assign((size_t) n_clusters, 0.0);
++                cl_counts.assign((size_t) n_clusters, 0);
++                std::vector<std::vector<double>> thr_rad((size_t) nth, std::vector<double>((size_t) n_clusters, 0.0));
++                std::vector<std::vector<int>>    thr_cnt2((size_t) nth, std::vector<int>((size_t) n_clusters, 0));
++                pool.run(nth, [&](int tid, int nt) {
++                    const int64_t r0 = (n_vocab * tid) / nt;
++                    const int64_t r1 = (n_vocab * (tid + 1)) / nt;
++                    std::vector<uint8_t> lq4(row_sz);
++                    std::vector<float>   lf((size_t) ne0);
++                    auto & rad  = thr_rad[(size_t) tid];
++                    auto & cnts = thr_cnt2[(size_t) tid];
++                    for (int64_t r = r0; r < r1; ++r) {
++                        if (in_sl[(size_t) r]) continue;
++                        ops->q4_k_unrepack_row(w, r, lq4.data());
++                        q4_traits->to_float(lq4.data(), lf.data(), ne0);
++                        int best_k = 0;
++                        float best_sc = -1e30f;
++                        for (int k = 0; k < n_clusters; ++k) {
++                            const float * c = cl_centroids.data() + (size_t) k * (size_t) ne0;
++                            float dot = 0.0f;
++                            for (int64_t j = 0; j < ne0; ++j) dot += (lf[(size_t) j] - (float) w_mean[(size_t) j]) * c[j];
++                            const float sc = 2.0f * dot - c_norm2[(size_t) k];
++                            if (sc > best_sc) { best_sc = sc; best_k = k; }
++                        }
++                        const float * c = cl_centroids.data() + (size_t) best_k * (size_t) ne0;
++                        double d2 = 0.0, w2 = 0.0;
++                        for (int64_t j = 0; j < ne0; ++j) {
++                            const double x = (double) lf[(size_t) j];
++                            const double d = x - w_mean[(size_t) j] - (double) c[j];
++                            d2 += d * d;
++                            w2 += x * x;
++                        }
++                        const double br = sqrt(d2) + eps_fp * sqrt(w2);
++                        if (br > rad[(size_t) best_k]) rad[(size_t) best_k] = br;
++                        cnts[(size_t) best_k]++;
++                    }
++                });
++                for (int k = 0; k < n_clusters; ++k) {
++                    for (int t = 0; t < nth; ++t) {
++                        cl_counts[(size_t) k] += thr_cnt2[(size_t) t][(size_t) k];
++                        if (thr_rad[(size_t) t][(size_t) k] > cl_radii[(size_t) k]) {
++                            cl_radii[(size_t) k] = thr_rad[(size_t) t][(size_t) k];
++                        }
++                    }
++                }
++            }
++        }
++
++        const double init_ms = (ggml_time_us() - t0) / 1000.0;
++        if (mode == MODE_LOSSY_PURE || mode == MODE_LOSSY_MARGIN) {
++            fprintf(stderr, "[head] WARNING: LOSSY mode=%s (NOT exact) K=%zu init_ms=%.1f\n",
++                    mode_name(mode), sl_ids.size(), init_ms);
++        } else {
++            fprintf(stderr, "[head] init mode=%s (EXACT) K=%zu max_r=%.4f clusters=%d init_ms=%.1f\n",
++                    mode_name(mode), sl_ids.size(), max_r_non_sl, n_clusters, init_ms);
++        }
++        fflush(stderr);
++        return true;
++    }
++
++    llama_token eval_greedy(const float * h_f32, int n_threads) {
++        n_calls++;
++        const int nth = std::max(1, n_threads);
++
++        const int64_t t0 = ggml_time_us();
++        ops->q4_k_quantize_h(ne0, h_f32, h_q8_k.data());
++
++        // 1. Shortlist GEMV (parallel across nth threads, exact same Q4_K kernel as full head)
++        const int64_t sl_n = (int64_t) sl_ids.size();
++        pool.run(nth, [&](int tid, int nt) {
++            int64_t r0 = ((sl_n * tid) / nt) & ~7LL;
++            int64_t r1 = (tid + 1 == nt) ? sl_n : (((sl_n * (tid + 1)) / nt) & ~7LL);
++            if (r1 > r0) {
++                ops->q4_k_gemv_rows(ne0, sl_n, sl_repacked.data(), r0, r1 - r0, h_q8_k.data(), sl_logits.data() + r0);
++            }
++        });
++
++        llama_token best_tok = sl_ids[0];
++        float best_raw  = sl_logits[0];
++        float best_soft = apply_softcap(best_raw);
++        float second_soft = -INFINITY;
++        for (int64_t i = 1; i < sl_n; ++i) {
++            const float raw = sl_logits[(size_t) i];
++            const float soft = apply_softcap(raw);
++            const llama_token tok = sl_ids[(size_t) i];
++            if (soft > best_soft || (soft == best_soft && tok < best_tok)) {
++                second_soft = best_soft;
++                best_soft   = soft;
++                best_raw    = raw;
++                best_tok    = tok;
++            } else if (soft > second_soft) {
++                second_soft = soft;
++            }
++        }
++        const int64_t t1 = ggml_time_us();
++        sl_us += (double) (t1 - t0);
++
++        // 2. Certificate / heuristic check
++        bool skip_full = false;
++        if (mode == MODE_LOSSY_PURE) {
++            skip_full = true;
++        } else if (mode == MODE_LOSSY_MARGIN) {
++            skip_full = (best_soft >= lossy_logit_th) && ((best_soft - second_soft) >= lossy_margin_th);
++        } else {
++            ops->q8_k_dequant(ne0, h_q8_k.data(), h_deq.data());
++            double h2 = 0.0, mean_dot = 0.0;
++            for (int64_t j = 0; j < ne0; ++j) {
++                const double hj = (double) h_deq[(size_t) j];
++                h2 += hj * hj;
++                mean_dot += w_mean[(size_t) j] * hj;
++            }
++            const double h_norm = sqrt(h2);
++            double ub = 0.0;
++            if (mode == MODE_EXACT_NORM) {
++                ub = mean_dot + max_r_non_sl * h_norm;
++            } else {
++                ub = -1e30;
++                for (int k = 0; k < n_clusters; ++k) {
++                    if (cl_counts[(size_t) k] == 0) continue;
++                    const float * c = cl_centroids.data() + (size_t) k * (size_t) ne0;
++                    double cdot = 0.0;
++                    for (int64_t j = 0; j < ne0; ++j) {
++                        cdot += (double) c[j] * (double) h_deq[(size_t) j];
++                    }
++                    const double uk = mean_dot + cdot + cl_radii[(size_t) k] * h_norm;
++                    if (uk > ub) ub = uk;
++                }
++            }
++            const double excess = ub - (double) best_raw;
++            if (excess < min_ub_excess) min_ub_excess = excess;
++            const float ub_f = std::nextafter((float) ub, INFINITY);
++            const float ub_soft = apply_softcap(ub_f);
++            if (ub_f < best_raw && ub_soft < best_soft) {
++                skip_full = true;
++            }
++        }
++        const int64_t t2 = ggml_time_us();
++        cert_us += (double) (t2 - t1);
++
++        if (skip_full) {
++            n_skip++;
++            return best_tok;
++        }
++
++        // 3. Exact full-head fallback (bit-identical Q4_K kernel + monotonic ascending softcap argmax)
++        n_fallback++;
++        std::vector<llama_token> loc_tok((size_t) nth, 0);
++        std::vector<float>       loc_soft((size_t) nth, -INFINITY);
++        pool.run(nth, [&](int tid, int nt) {
++            int64_t r0 = ((n_vocab_padded * tid) / nt) & ~7LL;
++            int64_t r1 = (tid + 1 == nt) ? n_vocab_padded : (((n_vocab_padded * (tid + 1)) / nt) & ~7LL);
++            if (r1 <= r0) return;
++            ops->q4_k_gemv_rows(ne0, n_vocab_padded, w->data, r0, r1 - r0, h_q8_k.data(), full_logits.data() + r0);
++            const int64_t v_end = std::min(r1, n_vocab);
++            if (r0 >= v_end) return;
++            llama_token bt = (llama_token) r0;
++            float br = full_logits[(size_t) r0];
++            float bs = apply_softcap(br);
++            for (int64_t v = r0 + 1; v < v_end; ++v) {
++                const float r = full_logits[(size_t) v];
++                if (r > br) {
++                    const float s = apply_softcap(r);
++                    if (s > bs) {
++                        bs = s;
++                        br = r;
++                        bt = (llama_token) v;
++                    } else {
++                        br = r;
++                    }
++                }
++            }
++            loc_tok[(size_t) tid]  = bt;
++            loc_soft[(size_t) tid] = bs;
++        });
++
++        llama_token res_tok = loc_tok[0];
++        float res_soft = loc_soft[0];
++        for (int t = 1; t < nth; ++t) {
++            if (loc_soft[(size_t) t] > res_soft) {
++                res_soft = loc_soft[(size_t) t];
++                res_tok  = loc_tok[(size_t) t];
++            }
++        }
++        const int64_t t3 = ggml_time_us();
++        fb_us += (double) (t3 - t2);
++        return res_tok;
++    }
++};
++
+ llama_context::llama_context(
+         const llama_model & model,
+               llama_context_params params) :
+@@ -201,6 +781,7 @@ llama_context::llama_context(
+     cparams.embeddings_nextn_masked = false;
+     cparams.offload_kqv             = params.offload_kqv;
+     cparams.no_perf                 = params.no_perf;
++    cparams.greedy_head_skip_logits = false;
+ 
+     // +1: id n_layer() taps the output of the last layer ("input" of the head)
+     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+@@ -1406,6 +1987,71 @@ void llama_context::set_embeddings(bool value) {
+     }
+ 
+     cparams.embeddings = value;
++    update_greedy_head_active();
++}
++
++void llama_context::update_greedy_head_active() {
++    bool active = greedy_head_requested
++        && lm_head_sl != nullptr
++        && !cparams.embeddings
++        && !cparams.training
++        && sampling.samplers.empty()
++        && model.output != nullptr
++        && model.output_b == nullptr
++        && model.output_s == nullptr
++        && model.output_in_s == nullptr
++        && model.hparams.f_logit_scale == 0.0f;
++
++    if (active && loras) {
++        for (const auto & [adapter, scale] : *loras) {
++            if (scale != 0.0f && adapter->get_weight(model.output) != nullptr) {
++                active = false;
++                break;
++            }
++        }
++    }
++
++    if (cparams.greedy_head_skip_logits != active) {
++        cparams.greedy_head_skip_logits = active;
++        sched_need_reserve = true;
++    }
++}
++
++void llama_context::set_greedy_head(bool value) {
++    greedy_head_requested = value;
++    if (value && !lm_head_sl && llama_lm_head_shortlist::parse_env_mode() != llama_lm_head_shortlist::MODE_OFF) {
++        if (backend_cpu && model.output) {
++            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
++            auto * get_ops = reg ? (ggml_cpu_lm_head_get_ops_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_lm_head_get_ops") : nullptr;
++            if (get_ops) {
++                auto sl = std::make_unique<llama_lm_head_shortlist>();
++                if (sl->init(get_ops(), model.output, model.vocab.n_tokens(), model.hparams.f_final_logit_softcapping, cparams.n_threads)) {
++                    lm_head_sl = std::move(sl);
++                }
++            }
++        }
++    }
++    update_greedy_head_active();
++}
++
++llama_token llama_context::get_greedy_token_ith(int32_t i) {
++    output_reorder();
++    if (greedy_head_last_batch) {
++        const int64_t j = output_resolve_row(i);
++        return greedy_tokens[(size_t) j];
++    }
++    const float * l = get_logits_ith(i);
++    if (!l) {
++        return LLAMA_TOKEN_NULL;
++    }
++    const int n_vocab = (int) model.vocab.n_tokens();
++    llama_token best = 0;
++    for (int v = 1; v < n_vocab; ++v) {
++        if (l[v] > l[best]) {
++            best = v;
++        }
++    }
++    return best;
+ }
+ 
+ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+@@ -1726,6 +2372,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+         sampling.samplers[seq_id] = sampler;
+ 
+         sched_need_reserve = true;
++        update_greedy_head_active();
+ 
+         return true;
+     }
+@@ -1765,6 +2412,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
+     }
+ 
+     sched_need_reserve = true;
++    update_greedy_head_active();
+ }
+ 
+ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
+@@ -2241,6 +2889,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+ 
++    update_greedy_head_active();
++    greedy_head_last_batch = cparams.greedy_head_skip_logits;
++    if (greedy_head_last_batch) {
++        greedy_tokens.assign(n_outputs_all, 0);
++    }
++
+     sched_reserve();
+ 
+     bool did_optimize = false;
+@@ -2421,6 +3075,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+             }
++        } else if (cparams.greedy_head_skip_logits && n_outputs > 0) {
++            auto * t_embd_head = res->get_embd();
++            GGML_ASSERT(t_embd_head != nullptr);
++            const int64_t n_embd_out = hparams.n_embd_out();
++            std::vector<float> h_buf((size_t) (n_outputs * n_embd_out));
++            ggml_backend_tensor_get(t_embd_head, h_buf.data(), 0, h_buf.size() * sizeof(float));
++            const int nth = ubatch.n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads;
++            for (uint32_t o = 0; o < n_outputs; ++o) {
++                greedy_tokens[(size_t) (n_outputs_prev + (int64_t) o)] = lm_head_sl->eval_greedy(h_buf.data() + (size_t) o * (size_t) n_embd_out, nth);
++            }
+         }
+ 
+         // extract embeddings
+@@ -2863,6 +3527,10 @@ void llama_context::output_reorder() {
+             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
+             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+         }
++
++        if (greedy_head_last_batch && greedy_tokens.size() > std::max(i0, i1)) {
++            std::swap(greedy_tokens[(size_t) i0], greedy_tokens[(size_t) i1]);
++        }
+     }
+ 
+     output_swaps.clear();
+@@ -4672,6 +5340,15 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+     return res;
+ }
+ 
++void llama_set_greedy_head(llama_context * ctx, bool value) {
++    ctx->set_greedy_head(value);
++}
++
++llama_token llama_get_greedy_token_ith(llama_context * ctx, int32_t i) {
++    ctx->synchronize();
++    return ctx->get_greedy_token_ith(i);
++}
++
+ float * llama_get_embeddings(llama_context * ctx) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 3e3921c..424e924 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -19,6 +19,7 @@
+ struct llama_model;
+ class llama_batch_allocr;
+ class llama_moe_cache;
++struct llama_lm_head_shortlist;
+ 
+ class llama_io_read_i;
+ class llama_io_write_i;
+@@ -84,6 +85,9 @@ struct llama_context {
+     float * get_logits();
+     float * get_logits_ith(int32_t i);
+ 
++    void        set_greedy_head(bool value);
++    llama_token get_greedy_token_ith(int32_t i);
++
+     float * get_embeddings();
+     float * get_embeddings_ith(int32_t i);
+     float * get_embeddings_seq(llama_seq_id seq_id);
+@@ -510,4 +514,11 @@ private:
+     mutable int32_t n_eval   = 0; // number of eval calls
+ 
+     mutable int32_t n_reused = 0; // number of times the previous graph was reused
++
++    // opt-in greedy LM-head shortlist (LLAMA_LM_HEAD_SHORTLIST, default off)
++    bool greedy_head_requested  = false;
++    bool greedy_head_last_batch = false;
++    std::vector<llama_token> greedy_tokens;
++    std::unique_ptr<llama_lm_head_shortlist> lm_head_sl;
++    void update_greedy_head_active();
+ };
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index c93494f..16012a1 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -53,6 +53,7 @@ struct llama_cparams {
+     bool pipeline_parallel;
+     bool training;           // set by llama_opt_init()
+     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
++    bool greedy_head_skip_logits = false; // skip full LM head in graph when greedy shortlist handles it
+ 
+     size_t moe_cache_size;
+     float  moe_cache_cpu_share;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1bd3f8d..3869d1b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2355,6 +2355,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+ 
++    // the merged gate_up and the down projections use the same selected experts (CPU expert cache read-ahead)
++    if (gate_up_exps) {
++        ggml_mmid_register_pair(gate_up_exps, down_exps);
++    }
++
+     ggml_tensor * logits = nullptr;
+ 
+     if (probs_in == nullptr) {
+@@ -2440,6 +2445,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     ggml_tensor * selected_experts = selected_experts_in;
+     if (selected_experts == nullptr) {
+         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
++        if (gate_up_exps && selected_experts && selected_experts->src[0]) {
++            ggml_mmid_register_router(selected_experts->src[0], gate_up_exps);
++        }
+         cb(selected_experts->src[0], "ffn_moe_argsort", il);
+     }
+     cb(selected_experts, "ffn_moe_topk", il);
+@@ -4554,6 +4562,13 @@ void llm_graph_context::build_logits() const {
+         res->t_logits = nullptr;
+     }
+ 
++    // greedy shortlist computes the LM head outside the graph from res->t_embd
++    if (cparams.greedy_head_skip_logits && res->t_embd != nullptr && res->t_logits != nullptr) {
++        res->t_logits = nullptr;
++        ggml_build_forward_expand(gf, res->t_embd);
++        return;
++    }
++
+     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
+     if (res->t_logits != nullptr) {
+         ggml_build_forward_expand(gf, res->t_logits);
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 02e4ede..ba47d7f 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -722,6 +722,7 @@ struct llama_mmap::impl {
+         if (addr == MAP_FAILED) {
+             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+         }
++        ggml_file_map_register(addr, file->size(), fd);
+ 
+         // page-aligned madvise over [beg, end), clamped to the file
+         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 808fb44..93664fb 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1208,14 +1208,20 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+     return true;
+ }
+ 
++static bool llama_bf16_to_f16_enabled() {
++    const char * v = getenv("LLAMA_BF16_TO_F16");
++    return v != nullptr && atoi(v) == 1;
++}
++
+ struct ggml_tensor * llama_model_loader::create_tensor(
+         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     // set below, before buft_for_tensor() runs
+     bool is_lazy = false;
++    bool no_mmap = false;
+ 
+     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+-        const ctx_key key { buft, is_lazy };
++        const ctx_key key { buft, is_lazy, no_mmap };
+ 
+         auto it = ctx_map.find(key);
+         if (it == ctx_map.end()) {
+@@ -1440,6 +1446,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     }
+ 
+     ggml_tensor t_meta = *cur;
++    // LLAMA_BF16_TO_F16=1: widen-friendly F16 avoids ARM scalar BF16 vec_dot
++    if (llama_bf16_to_f16_enabled() && !is_lazy && t_meta.type == GGML_TYPE_BF16 && ggml_n_dims(&t_meta) == 2) {
++        t_meta.type = GGML_TYPE_F16;
++        no_mmap = true;
++    }
+     if (flags & TENSOR_ALLOW_RESHAPE) {
+         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+@@ -1521,7 +1532,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+                 }
+             }
+ 
+-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
++            // LLAMA_MMAP_NO_PREFETCH: do not ask the OS to read the whole file (model larger than RAM)
++            const size_t prefetch_size = prefetch && use_mmap && getenv("LLAMA_MMAP_NO_PREFETCH") == nullptr ? -1 : 0;
+ 
+             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
+                     lazy.for_file(idx));
+@@ -1775,6 +1787,7 @@ bool llama_model_loader::load_all_data(
+         });
+     }
+ 
++    size_t n_bf16_to_f16 = 0;
+     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
+     // allocated from the CPU buffer type, which uses vm_allocate on Apple platforms, so freeing it returns its pages to the OS right away
+     ggml_backend_buffer_ptr read_buf;
+@@ -1793,7 +1806,8 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
+-        const bool from_mapping = use_mmap || lazy.has(cur);
++        const bool convert_bf16 = cur->type == GGML_TYPE_F16 && weight->tensor->type == GGML_TYPE_BF16;
++        const bool from_mapping = (use_mmap || lazy.has(cur)) && !convert_bf16;
+ 
+         if (from_mapping) {
+             const auto & mapping = mappings.at(weight->idx);
+@@ -1837,6 +1851,15 @@ bool llama_model_loader::load_all_data(
+             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                 file->seek(weight->offs, SEEK_SET);
+                 file->read_raw(cur->data, n_size);
++                if (convert_bf16) {
++                    const int64_t ne = ggml_nelements(cur);
++                    const ggml_bf16_t * src = (const ggml_bf16_t *) cur->data;
++                    ggml_fp16_t * dst = (ggml_fp16_t *) cur->data;
++                    for (int64_t i = 0; i < ne; ++i) {
++                        dst[i] = ggml_fp32_to_fp16(ggml_bf16_to_fp32(src[i]));
++                    }
++                    n_bf16_to_f16++;
++                }
+                 if (check_tensors) {
+                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+@@ -1844,7 +1867,7 @@ bool llama_model_loader::load_all_data(
+                 }
+             } else {
+                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
+-                if (upload_backend) {
++                if (upload_backend && !convert_bf16) {
+                     size_t offset = weight->offs;
+                     alignment = file->read_alignment();
+                     size_t aligned_offset = offset & ~(alignment - 1);
+@@ -1918,7 +1941,16 @@ bool llama_model_loader::load_all_data(
+                     file->seek(aligned_offset, SEEK_SET);
+                     file->read_raw_unsafe(read_dst, read_size);
+ 
+-                    const uint8_t * data = read_dst + pad;
++                    uint8_t * data = read_dst + pad;
++                    if (convert_bf16) {
++                        const int64_t ne = ggml_nelements(cur);
++                        const ggml_bf16_t * src = (const ggml_bf16_t *) data;
++                        ggml_fp16_t * dst = (ggml_fp16_t *) data;
++                        for (int64_t i = 0; i < ne; ++i) {
++                            dst[i] = ggml_fp32_to_fp16(ggml_bf16_to_fp32(src[i]));
++                        }
++                        n_bf16_to_f16++;
++                    }
+                     ggml_backend_tensor_set(cur, data, 0, n_size);
+                     if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+@@ -1929,6 +1961,9 @@ bool llama_model_loader::load_all_data(
+ 
+         size_done += n_size;
+     }
++    if (n_bf16_to_f16 > 0) {
++        LLAMA_LOG_INFO("%s: LLAMA_BF16_TO_F16 converted %zu 2D BF16 tensors to F16\n", __func__, n_bf16_to_f16);
++    }
+ 
+     // free temporary resources used for async uploads
+     for (auto * event : events) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..2332450 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -145,10 +145,11 @@ struct llama_model_loader {
+         }
+     };
+ 
+-    // lazy tensors need dedicated context
++    // lazy and load-converted tensors need dedicated contexts
+     struct ctx_key {
+         ggml_backend_buffer_type_t buft;
+         bool lazy;
++        bool no_mmap;
+     };
+ 
+     struct ctx_key_comparator {
+@@ -156,6 +157,9 @@ struct llama_model_loader {
+             if (lhs.lazy != rhs.lazy) {
+                 return lhs.lazy < rhs.lazy;
+             }
++            if (lhs.no_mmap != rhs.no_mmap) {
++                return lhs.no_mmap < rhs.no_mmap;
++            }
+             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
+         }
+     };
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 06eb7c9..e8c196e 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2130,7 +2130,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+ 
+-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++        if (!ctx_key.no_mmap && (ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+             GGML_ASSERT(!ml.no_alloc);
+             const size_t max_size = ggml_get_max_tensor_size(ctx);
+ 
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+index 8366a11..bbe9c47 100644
+--- a/src/models/inkling2-loop.cpp
++++ b/src/models/inkling2-loop.cpp
+@@ -16,7 +16,8 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
+     n_phys = hparams.n_layer();
+     const uint32_t block = hparams.attn_res_block_size;
+     // a fixed loop needs at least 2 passes, a variable loop at least 1
+-    if (n_passes < (varying ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
++    // local: INKLING_ALLOW_ONE_PASS allows 1 pass on a fixed loop, for experiments
++    if (n_passes < ((varying || getenv("INKLING_ALLOW_ONE_PASS")) ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
+         core_start % block || core_end % block || hparams.n_layer_nextn) {
+         throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
+                 core_start, core_end, block, n_passes, gate_rank, n_phys));
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 45477a6..cd777dc 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -152,8 +152,8 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
+         layer.ffn_norm         = create_tensor(tn(LLM_TENSOR_FFN_NORM,         "weight", i), {n_embd}, 0);
+         layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, 0);
+         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
+-        layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
+-        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
++        layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, TENSOR_READ_LAZY);
++        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, TENSOR_READ_LAZY);
+     }
+ }
+ 

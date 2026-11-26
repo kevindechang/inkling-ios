@@ -1,0 +1,43 @@
+{
+  "name": "inkling-ios-dev-271",
+  "description": "Public code-scored reasoning, tool-use, and instruction-following benchmark suite for inkling-ios (plus 20 writing prompts). Explicitly excludes coding and obscure trivia.",
+  "pillars": {
+    "reasoning": {
+      "total": 120,
+      "datasets": {
+        "gsm8k_hard": { "n": 30, "scorer": "math_exact", "think": true, "think_budget": 1024 },
+        "math500": { "n": 30, "scorer": "math_exact", "think": true, "think_budget": 1024 },
+        "logic": { "n": 30, "scorer": "logic_order", "think": true, "think_budget": 1024 },
+        "gpqa_diamond": { "n": 30, "scorer": "mc_letter", "think": false }
+      }
+    },
+    "tool_use": {
+      "total": 76,
+      "datasets": {
+        "bfcl_simple": 10,
+        "bfcl_multiple": 8,
+        "bfcl_parallel": 7,
+        "bfcl_parallel_multiple": 7,
+        "bfcl_irrelevance": 8,
+        "bfcl_live_simple": 10,
+        "bfcl_live_multiple": 10,
+        "bfcl_live_parallel": 4,
+        "bfcl_live_parallel_multiple": 4,
+        "bfcl_live_irrelevance": 8
+      }
+    },
+    "writing_instructions": {
+      "total": 75,
+      "datasets": {
+        "ifeval": { "n": 40, "scorer": "ifeval_strict" },
+        "ifbench": { "n": 35, "scorer": "ifeval_strict" }
+      }
+    },
+    "writing_prose_check": {
+      "total": 20,
+      "datasets": {
+        "oasst2_write": { "n": 20, "scorer": "pairwise_vs_3p_k8" }
+      }
+    }
+  }
+}
