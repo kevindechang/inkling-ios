@@ -2,7 +2,7 @@
 
 **Running a 26.4B-parameter looped Mixture-of-Experts model (`TML-d24-varloop-research` / Inkling 2) at ~20 tok/s on iPhone 15 Pro CPU — under 4.7 GB RAM, keeping reasoning, writing, and tool use intact.**
 
-> **Status:** Active engineering log & reproducible build. Speed shape (`varloop-stage2-v1.gguf`) is **locked** at **`43–44 ms` (`22.7–23.3 tok/s`)** zero-miss compute on A17 Pro (`-t 2`). Public 271-item reasoning/tool/instruction baseline is running now; Stage 3 short-thinking distillation + direct GGUF merge is next.
+> **Status:** Active engineering log & reproducible build. **True sustained `20–21 tok/s`** (`47.5 ms/tok` mean across 430 tokens, `49.4 ms` = `20.23 tok/s` last 250 tokens, `4,365 MB` RAM) is **proven on iPhone 15 Pro** (`v28`, `e48`). Zero-shot pruning below `e88` collapses math (`e96 80% → e88 50% → e80 20% → e64/e48 0%`), so Stage 3 Expert+Dense LoRA distillation + short-thinking training + direct GGUF merge is next.
 
 ---
 
@@ -10,12 +10,12 @@
 
 | Goal | Target | Measured Today (iPhone 15 Pro / Mac) | Status |
 |---|---|---|---|
-| **Decode speed** | **`20 tok/s`** (`50 ms/tok` sustained) | **`43–44 ms` (`22.7–23.3 t/s`)** zero-miss compute floor (`-t 2`, `cpu 86 ms`); **`10.1–13.7 t/s`** (`73–99 ms`) on real tokens with `11–19` flash misses (`v26`) | **Compute met; flash wait (`+25–45 ms`) still blocks true sustained 20 t/s → testing REAP expert pruning (`128 → 48–64`) next** |
-| **Memory** | **`<= 4.7 GB`** (under 6 GiB iOS limit) | **`4.47–4.69 GB`** (`3000–3250 MB` explicit expert cache) | **Met** |
-| **Thermals** | Cool (`nominal → fair`) | **`-37%` CPU/tok** vs baseline (`86 ms` vs `138 ms` on 2 P-cores) | **Met** |
-| **TTFT** | **`<= 2.0 s`** | **`2.13 s`** honest cross-prompt warm Turn 2 (`28` new tok, `-tb 4`, `IO=4`, `-state-load`); **`0.81 s`** (`34.5 t/s`) hot cache; `4.28 s` cold 58-tok (`v27`) | **Essentially met** (`-65%` from `6.03 s` baseline) |
-| **Reasoning / Writing / Tool Use** | **Mostly intact** *(coding & trivia allowed to drop)* | Live Stage 2 (*pre-retrain*, old mismatched LoRA): **`GSM8K-Hard 83.3%`**, **`MATH-500 60.0%`**, `Logic 30.8%` *(13)*, **`BFCL 90%`** *(20)* | **271-item baseline running; Stage 3 heal + short thinking next** |
-| **Thinking length** | **Concise** (`~150–250 tok`) | `535–840 tok` today | **Stage 3 focus** (inference caps broke reasoning; must be trained) |
+| **Sustained decode** | **`>= 20 tok/s`** (`<= 50 ms/tok` mean, no cheating) | **`21.06 tok/s`** (`47.5 ms` mean tok `20–449`, **`20.23 tok/s`** last 250 tok, `miss 0.3–0.7/t`, `fair → fair`) on **`e48`** (`3.07 GiB` experts, `v28`); `128e` `stage2-v1` is `43–44 ms` zero-miss / `10–14 t/s` with flash misses | **Speed envelope proven** (`<= 3.35 GiB` experts fits 100% in RAM) |
+| **Memory** | **`<= 4.5 GB`** (under 6 GiB iOS limit) | **`4,365 MB`** (`e48`, `3300 MB` cache, cool `fair`); `e64` (`4,892 MB`, `3500 MB` cache) tripped `serious` | **Hard envelope mapped (`<= 4.45 GB`)** |
+| **Context window** | **`8K–16K`** viable at ~20 tok/s | `20/24` layers are SWA `1024` (fixed); only `4` full-attention layers (`8 KB/tok` at `Q8_0` KV → `104–168 MiB` for `8K–16K`) | **Architecture-friendly; `-ctk/-ctv q8_0` wired** |
+| **TTFT** | **`<= 2.0 s`** | **`2.13 s`** honest cross-prompt warm Turn 2 (`128e`, `-tb 4`, `IO=4`, `-state-load`); **`0.81 s`** hot cache; **`2.99–3.02 s`** cold 70-tok on `e48` *without* state reuse (`< 2 s` with state reuse) | **Essentially met** (`-65%` from `6.03 s`) |
+| **Reasoning / Writing / Tool Use** | **Mostly intact** *(coding & trivia allowed to drop)* | Full `128e` `stage2-v1` (*pre-Stage 3*, 236 items): **`GSM8K-Hard 83.3%`**, **`MATH-500 60.0%`**, `Logic 20.0%`, `GPQA 16.7%`, **`BFCL 85.5%`**, `IFEval 52.5%`. Zero-shot pruned: `e96 80% → e88 50% → e80 20% → e64/e48 0%` | **Needs Stage 3 Expert+Dense LoRA heal on `e56/e60-compact` (`3.1–3.3 GiB`)** |
+| **Thinking length** | **Concise** (`~150–250 tok`) | `596–1,099 tok` pre-Stage 3 | **Stage 3 focus** (inference caps broke reasoning; must be trained) |
 
 ---
 

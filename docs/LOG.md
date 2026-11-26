@@ -14,7 +14,8 @@ Complete, transparent chronological record of every experiment, measured number,
 | **P29** (Nov 23) | Sibling `varloop` `Q2_K_XL`, 1p K4, `-t 4` | `50 ms` | `14.2–15.4 tok/s` (`65–70 ms`) | `4.6 GB` | fair | Switched to `TML-d24-varloop-research` (coherent at 1p K4!) |
 | **P37** (Nov 24) | Sibling `Q2_K_XL`, 1p K4, `-t 2`, `OVERLAP=1` | `~66 ms` | `13.0–13.2 tok/s` (`72–73 ms`) | `4.68 GB` | fair | Atomic known-route paired-`down` overlap (`-40%` ms, `-33%` CPU) |
 | **v21** (Nov 26) | + `IOS_I8MM=1` (`armv8.6+i8mm`), `-t 2` | **`69.0 ms`** (`cpu 138`) | **`13.3 tok/s`** (`73.0 / 75.2 ms`) | `4.66 GB` | fair | Reproducible `-6.0 ms/tok` zero-miss win on A17 Pro |
-| **v26** (Nov 27) | **`varloop-stage2-v1.gguf`** + `REPACK=1` + NEON `Q2_K`, `-t 2`, `3250 MB` | **`43–44 ms`** (`22.7–23.3 t/s`, `cpu 86`) | `~18–20 tok/s` *(projected warm merged)* | `4.69 GB` | nominal | KL+DP quant (`23× Q2_K` `gate_up`, `Q4_K` `attn`) + `2.23×` faster NEON repack |
+| **v26** (Nov 27) | `varloop-stage2-v1` (128e) + `REPACK=1` + NEON `Q2_K`, `-t 2`, `3250 MB` | **`43–44 ms`** (`22.7–23.3 t/s`, `cpu 86`) | `10.1–13.7 tok/s` (`73–99 ms`, `11–19 miss/t`) | `4.69 GB` | nominal | KL+DP quant (`23× Q2_K`) + `2.23×` faster NEON repack; flash wait still `+25–45 ms` |
+| **v28** (Nov 27) | **`varloop-stage2-e48`** (48e, `4.08 GiB`), `REPACK=1`, `-t 2 -tb 4`, `3300 MB` | **`48.0 ms`** (`cpu 95`) | **`21.06 tok/s`** (`47.5 ms` tok `20–449`; **`20.23 t/s`** last 250 tok) | **`4.36 GB`** | fair | **True sustained `>= 20 tok/s` proven on iPhone 15 Pro** (`miss 0.3–0.7/t`, cold 70t prefill `3.0 s`) |
 
 ---
 
@@ -91,4 +92,23 @@ Complete, transparent chronological record of every experiment, measured number,
 - **Prefill TTFT optimization (`v27`):** Added `-tb N` (`n_threads_batch`) and `-wf` (warm turn-2 TTFT) + `-state-load` benchmarking to `ios/inkling_run.cpp`.
   - Cold 70-tok baseline (`-tb 2`): `6.03 s` (`4.01 s` flash wait on `3.75 GB` cold expert reads); warm 40-tok Turn 2: `3.08 s` (`-tb 2`) → **`2.67 s`** (`-tb 4`, optimal) vs `6.15 s` (`-tb 6`, starved I/O threads).
   - System-prompt KV state caching (`-state-save` / `-state-load`, `3.10 MB`, loads in **`0.01 s`**) + `-tb 4` + `GGML_MMID_IO_THREADS=4`: cold 70→58 tok dropped to **`4.28 s`**; **honest cross-prompt warm Turn 2 (`long1t → chat1t`, 28 new tok) dropped to `2.13 s`** (`thermal: fair → nominal`); hot-cache Turn 2 hit **`0.81 s` (`34.5 tok/s`)**.
-- **Public 271-item reasoning/tool/instruction benchmark suite:** Early Stage 2 (*before* Stage 3 retrain, old mismatched LoRA) hit **`GSM8K-Hard 25/30 (83.3%)`**, **`MATH-500 18/30 (60.0%)`** (ahead of `Gemma 4 26B Q4` `43.3%` and `Qwen 3.6 35B` `50.0%`), and `Logic 4/13 (30.8%)`, with high thinking tokens (`596–1,118 tok`) confirming Stage 3 short-thinking distillation as the final key milestone.
+- **Public 236-item reasoning/tool/instruction baseline (`varloop-stage2-v1`, *pre-Stage 3*, old mismatched `run3` LoRA):**
+  - **`GSM8K-Hard` (`30/30`):** **`83.3%`** (`25/30`, avg think `596`) — beats `Gemma 4 26B Q4` (`80.0%`).
+  - **`MATH-500` (`30/30`):** **`60.0%`** (`18/30`, avg think `728`) — beats `Gemma 4 26B Q4` (`43.3%`) and `Qwen 3.6 35B` (`50.0%`).
+  - **`Logic` (`30/30`):** `20.0%` (`6/30`, avg think `1,099`, matches `LFM3` `20.0%`); **`GPQA Diamond` (`30/30`):** `16.7%` (`5/30`, avg think `1,041`).
+  - **`BFCL Tool Use` (`76/76` ALL):** **`85.5%`** (`65/76`, avg think `129`) — matches `Qwen 3.6 35B` (`86.8%`).
+  - **`IFEval` (`40/40`):** `52.5%` (`21/40`, avg think `1,023`, hurt by old LoRA loops).
+- **REAP Expert Pruning + True Sustained `21.06 tok/s` on iPhone 15 Pro (`v28`):**
+  - Built `quant/reap_trace.cpp` (exact `cb_eval` REAP salience `sum_t |w_e| * ||down_e(x_t)||_2`) and `quant/prune_gguf.py` (raw quantized byte slicing, zero re-quantization).
+  - Traced `80,044` tokens (`188` docs at `150.5 tok/s`) on a leak-free Reasoning + Writing + Tool-Use corpus (`0%` coding, `0%` eval overlap).
+  - **Key structural discovery:** Because Thinking Machines already pruned `384 → 128` load-balanced experts, activation frequencies across all 128 experts are dead-flat (`2,500 ± 40` per expert in every layer). There are no dead or coding-only experts to drop for free.
+  - **iPhone 15 Pro `v28` (`varloop-stage2-e48.gguf`, `4.08 GiB`, `3.07 GiB` experts, `CACHE_MB=3300`, `REPACK=1`, `-t 2 -tb 4`, USB-C plugged):**
+    - Rep 2 (`e48_r1_c3300_b`, `n=450`, `thermal: fair → fair`): **ALL 450 tok mean `50 ms` (`20.17 tok/s`), tok `20–449` mean `47.5 ms` (`21.06 tok/s`, `med=48.0 ms`), LAST 250 tok mean `49.4 ms` (`20.23 tok/s`)**, **`miss=0.7/tok` (`0.3/tok` last 250)**, peak RAM **`4,365 MB`**, cold 70-tok prefill **`3.02 s` (`23.1 tok/s`)** without state reuse!
+    - Rep 1 (`e48_r1_c3300`): held `50.0 ms` (`20.0 tok/s`) through tok 374 before mild fast-charge dip (`mean 57 ms = 17.62 tok/s`), cold 70-tok prefill **`2.99 s` (`23.4 tok/s`)**.
+  - **iPhone 15 Pro `e64` (`5.13 GiB`, `4.09 GiB` experts, `CACHE_MB=3500`):** Cold 70-tok prefill `3.41 s`, `miss` fell to `0.5–1.5/tok`, **but `4,892 MB` footprint + charging tripped `thermal: serious`** (`417–565 ms`). Establishes **`<= 3.35 GiB` experts (`<= 4.45 GB` total RAM)** as the clean sustained `20+ tok/s` + `8K–16K` context envelope on a 6 GiB iPhone.
+- **Zero-Shot Pruning & 1-Bit Cliff Sweep (Mac `$0`, exact same 10 `GSM8K-Hard` items):**
+  - Added 5-line per-layer `n_expert[il]` support to `src/models/inkling2.cpp` and `-ctk/-ctv q8_0` KV quantization to `ios/inkling_run.cpp`.
+  - **Uniform REAP pruning curve (untrained):** `128e` **`9/10 (90%)`** → `e96` **`8/10 (80%)`** → `e88` **`5/10 (50%)`** → `e80` **`2/10 (20%)`** → `e64` **`0/14 (0%)`** → `e48` **`0/30 (0%)`**.
+  - **Layer-adaptive pruning (untrained):** `112×8 / 64×6 / 24×10` (`0/4`), `128×8 / 80×4 / 32×12` (`0/4`), `96×12 / 32×12` (`0/4`).
+  - **Naive 1-bit `Q1_0` (`1.125 bpw`, no imatrix, untrained):** `all 24L` (`0/10`, whitespace), `L12–23` (`0/4`, loops), `L16–23` (`0/4`, loops).
+  - **Conclusion:** Zero-shot compression cannot bridge `8.19 GiB → 3.35 GiB` without retraining. Next step is a gated Stage 3 self-distillation smoke test on **`e56/e60-compact`** (`56–60` experts, `Q2_K` `gate_up` + `Q2_0` `down` = **`3.11–3.34 GiB` experts**, 100% RAM-resident = proven `20–21 tok/s`) with **Expert LoRA + Full Router + Dense LoRA + Short Thinking** against the full 128-expert `3p K8` teacher, merged directly into one standalone GGUF (`0 ms` LoRA cost).

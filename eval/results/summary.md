@@ -18,9 +18,20 @@ Coding (`HumanEval`, `SWEBench`) and obscure trivia (`SimpleQA`, `SuperGPQA`, `H
 | `qwen36-35b-a3b-fp8` | 271 | `60.0%` | `86.8%` | `65.3%` | `70.7%` | `100.0%` | `50.0%` | `46.7%` | `43.3%` | `86.8%` | `90.0%` | `37.1%` | `339` |
 | `lfm3-r1c-q4` | 271 | `54.2%` | `77.6%` | `48.0%` | `59.9%` | `90.0%` | `66.7%` | `20.0%` | `40.0%` | `77.6%` | `72.5%` | `20.0%` | `275` |
 | `varloop-s-p3` (3p K8 teacher) | *running* | — | — | — | — | `100.0%` | `50.0%` *(10)* | *pending* | *pending* | `85.0%` *(40)* | `90.0%` | *pending* | `438` |
-| `varloop-stage2-v1` + old `run3` LoRA *(pre-Stage 3)* | *running* | — | — | — | — | `83.3%` *(30)* | **`60.0%`** *(30)* | `30.8%` *(13)* | *pending* | `90.0%` *(20)* | `60.0%` *(20)* | *pending* | `~700+` |
+| `varloop-stage2-v1` (128e) + old `run3` LoRA *(pre-Stage 3)* | 236 | `45.0%` | **`85.5%`** | `52.5%` *(40)* | — | **`83.3%`** | **`60.0%`** | `20.0%` | `16.7%` | **`85.5%`** | `52.5%` | *n/a* | `~700` |
 
-*(Updated automatically as the 271-item baseline and Stage 3 merged checkpoint finish.)*
+### 1b. Zero-Shot Pruning & 1-Bit Compression Cliff (`GSM8K-Hard`, 10-item diagnostic + full `e48`/`e64`)
+
+| Candidate (Untrained / Zero-Shot) | Experts / Layer | Expert RAM (`REPACK=1`) | `GSM8K-Hard` | Avg Think |
+|---|---:|---:|---:|---:|
+| `stage2-v1` (baseline) | `128` | `8.19 GiB` | **`9/10` (`90.0%`)** *(full 30: `83.3%`)* | `474` |
+| **`e96` (REAP uniform)** | `96` (`75%`) | `6.14 GiB` | **`8/10` (`80.0%`)** | `476` |
+| `e88` (REAP uniform) | `88` (`69%`) | `5.63 GiB` | `5/10` (`50.0%`) | `490` |
+| `e80` (REAP uniform) | `80` (`62.5%`) | `5.12 GiB` | `2/10` (`20.0%`) | `682` |
+| `e64` (REAP uniform) | `64` (`50%`) | `4.09 GiB` | `0/14` (`0.0%`) | `848` |
+| `e48` (REAP uniform) | `48` (`37.5%`) | **`3.07 GiB`** | `0/30` (`0.0%`) | `944` |
+| Layer-adaptive (`112/64/24`, `128/80/32`, `96/32`) | `24..128` | `4.0–4.6 GiB` | `0/4` each (`0.0%`) | `793–938` |
+| `128e` `Q1_0` (`L16–23`, `L12–23`, `all 24L`) | `128` (`1.125 bpw`) | `3.2–5.9 GiB` | `0/4` each (`0.0%`) | `1024` |
 
 ---
 
@@ -30,7 +41,9 @@ Coding (`HumanEval`, `SWEBench`) and obscure trivia (`SimpleQA`, `SuperGPQA`, `H
 |---|---:|---:|---:|---:|---|
 | `varloop-Q2_K_XL` (`3000 MB`, `v21`) | `69.0 ms` (`14.5 t/s`) | `138 ms` | `7.2–7.4 ms` | `4,663 MB` | `13.3 tok/s` sustained plugged-in 450 tok (`nominal → fair`) |
 | `varloop-stage2-v1` + `REPACK=1` (`3000 MB`, `v25`) | `48–54 ms` (`18.5–20.8 t/s`) | `93–106 ms` | `~4–6 ms` | `4,466 MB` | `-200 MB` RAM; `1.55×` faster even when throttled (`77` vs `119 ms`) |
-| `varloop-stage2-v1` + NEON `Q2_K` repack (`3250 MB`, `v26`) | **`43–44 ms` (`22.7–23.3 t/s`)** | **`86 ms`** | **`~3–5 ms`** | `4,694 MB` | `-37%` CPU heat; `-1.05 GB` flash reads; `nominal → nominal` |
+| `varloop-stage2-v1` + NEON `Q2_K` repack (`3250 MB`, `v26`) | **`43–44 ms` (`22.7–23.3 t/s`)** | **`86 ms`** | **`~3–5 ms`** *(11–19 miss/t -> `73–99 ms` real)* | `4,694 MB` | `-37%` CPU heat; flash wait blocks sustained 20 t/s on 128e |
+| **`varloop-stage2-e48` (`3300 MB`, `v28`, 450 tok)** | **`48.0 ms`** | **`95 ms`** | **`21.06 t/s` sustained** (`47.5 ms` tok `20–449`; **`20.23 t/s`** last 250; `0.3–0.7 miss/t`) | **`4,365 MB`** | **True sustained `>= 20 tok/s` proven (`fair → fair`)**; cold 70t prefill `2.99–3.02 s` |
+| `varloop-stage2-e64` (`3500 MB`, `v28`, 450 tok) | `~55 ms` *(early)* | `118–124 ms` | `0.5–1.5 miss/t`, but tripped `serious` (`417 ms`) | `4,892 MB` | Too close to 6 GiB limit during charging → target `<= 4.45 GB` |
 
 ---
 

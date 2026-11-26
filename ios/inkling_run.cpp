@@ -39,7 +39,7 @@ static bool on_progress(float p, void *) {
 }
 
 int inkling_gen(int argc, char ** argv) {
-    std::string lora, state_save, state_load, warm_prompt;   // -lora <file>: GGUF LoRA adapter applied at scale 1
+    std::string lora, state_save, state_load, warm_prompt, ctk = "f16", ctv = "f16";   // -lora <file>: GGUF LoRA adapter applied at scale 1
     std::string model, prompt = "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>Give me three short tips for sleeping better.<|end_message|><|message_model|>";
     int ngl = 99, n_gen = 32, n_ctx = 2048, n_ub = 64, threads = 4, threads_batch = 0; bool use_mmap = true; std::string cpu_pat; int passes = 0, n_used = 0; llama_lazy_mode lazy = LLAMA_LAZY_MODE_AUTO;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -47,6 +47,7 @@ int inkling_gen(int argc, char ** argv) {
         if (a == "-m") model = v; else if (a == "-lora") lora = v; else if (a == "-ngl") ngl = std::stoi(v); else if (a == "-n") n_gen = std::stoi(v);
         else if (a == "-c") n_ctx = std::stoi(v); else if (a == "-ub") n_ub = std::stoi(v); else if (a == "-t") threads = std::stoi(v);
         else if (a == "-tb") threads_batch = std::stoi(v);
+        else if (a == "-ctk") ctk = v; else if (a == "-ctv") ctv = v;
         else if (a == "-lm") use_mmap = v != "none"; else if (a == "-cpu") cpu_pat = v; else if (a == "-passes") passes = std::stoi(v); else if (a == "-k") n_used = std::stoi(v); else if (a == "-p") prompt = v;
         else if (a == "-lzm") lazy = v == "on" ? LLAMA_LAZY_MODE_ON : v == "off" ? LLAMA_LAZY_MODE_OFF : LLAMA_LAZY_MODE_AUTO;
         else if (a == "-f") { std::ifstream f(v); std::stringstream ss; ss << f.rdbuf(); prompt = ss.str(); }
@@ -77,8 +78,14 @@ int inkling_gen(int argc, char ** argv) {
     llama_model * m = llama_model_load_from_file(model.c_str(), mp);
     if (!m) { fprintf(stderr, "[gen] load failed\n"); return 1; }
     fprintf(stderr, "[gen] loaded t=%.1fs footprint=%.0f MB\n", now_s() - g_t0, footprint_mb());
+    auto parse_kv_type = [](const std::string & s) -> ggml_type {
+        if (s == "q8_0") return GGML_TYPE_Q8_0;
+        if (s == "q4_0") return GGML_TYPE_Q4_0;
+        return GGML_TYPE_F16;
+    };
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx; cp.n_batch = n_ub; cp.n_ubatch = n_ub; if (ngl == 0) { cp.op_offload = false; cp.offload_kqv = false; } cp.n_threads = threads; cp.n_threads_batch = threads_batch;
+    cp.type_k = parse_kv_type(ctk); cp.type_v = parse_kv_type(ctv);
     llama_context * ctx = llama_init_from_model(m, cp);
     if (!ctx) { fprintf(stderr, "[gen] context failed\n"); return 1; }
     llama_set_greedy_head(ctx, true);
