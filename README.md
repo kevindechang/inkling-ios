@@ -10,7 +10,7 @@
 
 | Goal | Target | Measured Today (iPhone 15 Pro / Mac) | Status |
 |---|---|---|---|
-| **Decode speed** | **`20 tok/s`** (`50 ms/tok`) | **`43–44 ms` (`22.7–23.3 tok/s`)** zero-miss floor (`-t 2`, `cpu 86 ms`); `~18–20 tok/s` projected warm merged | **Compute target met** (needs LoRA merge to drop `+7 ms` unmerged penalty) |
+| **Decode speed** | **`20 tok/s`** (`50 ms/tok` sustained) | **`43–44 ms` (`22.7–23.3 t/s`)** zero-miss compute floor (`-t 2`, `cpu 86 ms`); **`10.1–13.7 t/s`** (`73–99 ms`) on real tokens with `11–19` flash misses (`v26`) | **Compute met; flash wait (`+25–45 ms`) still blocks true sustained 20 t/s → testing REAP expert pruning (`128 → 48–64`) next** |
 | **Memory** | **`<= 4.7 GB`** (under 6 GiB iOS limit) | **`4.47–4.69 GB`** (`3000–3250 MB` explicit expert cache) | **Met** |
 | **Thermals** | Cool (`nominal → fair`) | **`-37%` CPU/tok** vs baseline (`86 ms` vs `138 ms` on 2 P-cores) | **Met** |
 | **TTFT** | **`<= 2.0 s`** | **`2.13 s`** honest cross-prompt warm Turn 2 (`28` new tok, `-tb 4`, `IO=4`, `-state-load`); **`0.81 s`** (`34.5 t/s`) hot cache; `4.28 s` cold 58-tok (`v27`) | **Essentially met** (`-65%` from `6.03 s` baseline) |
