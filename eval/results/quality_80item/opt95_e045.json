@@ -1,0 +1,17 @@
+{
+  "gsm8k": 73.3,
+  "math5": 30.0,
+  "logic": 20.0,
+  "gpqa": 20.0,
+  "bfcl": 75.0,
+  "ifeval": 46.7,
+  "reas": 40.0,
+  "mean": 53.9,
+  "avg_think_all": 761.0,
+  "avg_think_reas": 857.0,
+  "n": 80,
+  "mmid_tail": "[mmid] overlap=1 lru=1 coalesce=0 repack=1 pin_n=32 budget_mb=3000 hits=15586044 misses=1625706 read_mb=2241162.2 read_calls=1625706 wait_ms=451293.0 prefetch_issued=1254822 prefetch_used=1254822 prefetch_wasted=0 bypass_reads=0 repacked=1625706 repack_ms=144646.6 cecar_bonus=1.0000 cecar_calls=3360960 cecar_swaps=0",
+  "elapsed_s": 1979.0,
+  "effort": 0.45,
+  "cecar": 1.0
+}

@@ -49,8 +49,8 @@ fi
 APP=$HERE/build/InklingBench.app
 mkdir -p "$APP"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-xcrun --sdk iphoneos clang++ -target arm64-apple-ios"$MIN_IOS" -isysroot "$SDK" -std=c++17 -O2 -fobjc-arc \
-  -I"$L/include" -I"$L/ggml/include" "$HERE/ios_main.mm" "$HERE/inkling_run.cpp" \
+xcrun --sdk iphoneos clang++ -target arm64-apple-ios"$MIN_IOS" -march="$ARM_ARCH" -isysroot "$SDK" -std=c++17 -O2 -fobjc-arc \
+  -I"$L/include" -I"$L/ggml/include" -I"$HERE/../tools" "$HERE/ios_main.mm" "$HERE/inkling_run.cpp" \
   "$B/src/libllama.a" "$B/ggml/src/libggml.a" "$B/ggml/src/ggml-cpu/libggml-cpu.a" "$B/ggml/src/libggml-base.a" \
   -framework UIKit -framework Foundation -framework Accelerate \
   -o "$APP/InklingBench"

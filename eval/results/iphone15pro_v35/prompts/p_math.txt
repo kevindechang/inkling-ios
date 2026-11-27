@@ -1,0 +1,1 @@
+<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>A bookstore sells paperback novels for $12 and hardcover books for $25. On Saturday they sold 3 times as many paperbacks as hardcovers and took in $610 total. How many of each did they sell?<|end_message|><|message_model|>

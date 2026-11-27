@@ -58,5 +58,22 @@ Using a two-stage compiler inspired by LookAtMyQuant's `gguf_compiler.py`, speci
 
 ## 6. Quality Recovery & Short Thinking (`train/`)
 
-- **Why Stage 3 distillation + merge is required:** Cutting `3p K8 → 1p K4` + re-quantizing dense attention to `Q4_K` introduces repetition loops unless LoRA + AttnRes depth queries are calibrated against the exact quantized phone weights. Furthermore, unmerged LoRA adds `+7 ms/tok` at decode time on Stage 2 (`58` vs `53 ms`).
-- **Stage 3 design (next):** Train high-rank attention/router/LM-head LoRA + student-only F32 small-dense (`attn_res_query`, `ffn_res_query`, `output_res_query`, norms) against a clean BF16-dense 3p K8 teacher on concise reasoning + writing + tool-use trajectories (dropping coding data), then **merge directly into `varloop-stage2-v1.gguf`** (`0 ms` decode cost, `0 MB` extra RAM).
+- **Why Stage 2/3 distillation + merge is required:** Cutting `3p K8 → 1p K4` + re-quantizing dense attention to `Q4_K` introduces repetition loops unless LoRA + AttnRes depth queries are calibrated against the exact quantized phone weights. Furthermore, unmerged LoRA adds `+7 ms/tok` at decode time (`58` vs `53 ms`).
+- **Bit-exact local streaming BF16 merge (`quant/merge_run3_local.py`, `quant/merge_wsd_local.py`):** Streams only modified BF16 tensors via HTTP `Range` from Hugging Face, applies FP32 LoRA/router deltas, reorders experts `0..39 = HOT` (retaining all `128/128` experts), and quantizes directly via `libggml-base` `ggml_quantize_chunk` + official `imatrix` (`0 ms` LoRA decode cost, `0` double-quantization).
+
+---
+
+## 7. `Inkling-2-FlashPin-26B` (`v35`) — Closing the Unpruned `128e` `20+ tok/s` Gap
+
+Eliminating the gap between pruned RAM-resident runs (`v30`) and the unpruned `128/128`-expert model (`v35a`: **`23.43 tok/s`**, `v35f`: **`21.20 tok/s`** 375-tok, `v35d`: **`21.78 tok/s`** & `0.761 s` warm TTFT, `v35f_mix`: **`18.36 tok/s`** 400-tok 3-topic mix, all exact `200K` vocab & `nominal → nominal`) came from six coupled systems optimizations:
+
+1. **Hot-40 REAP Reordering & Pinning (`GGML_MMID_PIN_N=36..40`, `GGML_MMID_LRU=1`):** Permanently pins hot expert indices `0..PIN_N-1` in RAM while cold safety-net experts stream through the remaining dynamic LRU ring.
+2. **Per-Layer Cache-Aware Routing (`GGML_MMID_CECAR_LAYERS`, `GGML_MMID_CECAR_PREFILL=1`):** Replaces uniform routing bias with per-layer sensitivity budgets (`tools/optimize_cecar_layers.py`) so cache-tolerant layers absorb more hits while sensitive layers stay closer to the unperturbed router.
+3. **Compute-Buffer Halving (`-ub 64`) & iOS Memory-Compressor Avoidance:** At `-ub 128`, `llama.cpp` reserves a `242.7 MiB` CPU compute buffer, spiking `tok 0` footprint over iOS's `~4,450 MB` compressor cliff when `CACHE_MB >= 3000`. Using `-ub 64` (matching our 64-tok tiled FA and batched MoE chunk size) cuts the compute buffer to **`121.4 MiB`** (`-121 MiB` peak RAM), keeping every `v35` run in `3,975–4,364 MB` peak (`nominal → nominal`).
+4. **`i8mm` Tensor Upgrades (`quant/repack_i8mm_gguf.py`):** Replaces the remaining non-`i8mm` expert tensors (`blk.23` `Q3_K → Q4_K`, middle-layer `NVFP4`/`MXFP4` `down → Q4_0`) and quantizes F32 routers to `Q8_0` (`-20.8 MB`), dropping zero-miss decode from `43 ms → 36 ms`.
+5. **Lossless ARM64 NEON / Accelerate Compute Kernels:**
+   - **Multi-token 64-tok tiled GQA `Q8_0` Flash-Attention** (`ops.cpp`, `neq1 >= 1`, `max_diff <= 1.34e-7`).
+   - **Batched MoE repacked GEMM** (`ggml_mmid_repack_gemm`: zero-copy NEON `Q2_K`/`Q2_0` for `M=2,3,4` + gated `Q4_0`/`Q4_K` `i8mm`).
+   - **Row-broadcast NEON `ADD`/`SUB`/`MUL`/`DIV`** (`row-bcast-neon.h`): replaces length-1 per-element `vDSP` calls with IEEE `vaddq`/`vsubq`/`vmulq`/`vdivq` (`2,121,548` checks, `0` mismatches; `8.4×` per-call `MUL` speedup on Mac graph profile).
+   - **Fused `SiTU` (`GGML_GLU_OP_SITU`, `situ-neon.h`, `GGML_SITU_FAST=accel`):** Collapses Inkling 2's 9-node `SiTU` (`beta * tanh(gate/beta) * sigmoid(gate) * lb * tanh(up/lb)`) chain per layer into 1 op using Apple Accelerate `vvtanhf`/`vvexpf` (`3.10×` faster `GLU`), bringing A17 Pro zero-miss decode down to **`30–31 ms`** (`33 tok/s` compute ceiling) with exact `200K` vocab (`LLAMA_LM_HEAD_SHORTLIST=off`).
+6. **Reversible Offline Pre-Repacking (`tools/prerepack_exps.cpp`, `GGML_MMID_PREREPACKED=1`):** Every expert tensor (`Q2_K`, `Q2_0`, `Q4_0`, `Q4_K`, `IQ4_NL`) has the exact same byte count in raw and repacked layouts (`static_assert` in `repack.h`). Pre-repacking offline zeroes runtime `repack_ms` (`438–907 ms → 0.0 ms` in decode) and speeds up prefill (`5.17 → 4.14–4.50 s`) and miss-heavy multi-topic decode (`17.46 → 18.36 tok/s`) with a journaled bit-exact `--unpack` path.

@@ -1,0 +1,5 @@
+<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>Answer all three, briefly, in plain prose.
+1. A bookstore sold paperbacks for $12 and hardcovers for $25. On Saturday they sold three times as many paperbacks as hardcovers and took in $610. How many of each?
+2. Why does a cast-iron skillet stay hot longer than a thin steel pan? Two sentences, no jargon pile-up.
+3. Show a short Python function that counts word frequencies in a list of strings, using only the standard library.
+<|end_message|><|message_model|>

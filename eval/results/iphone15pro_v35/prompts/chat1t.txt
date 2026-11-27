@@ -1,0 +1,1 @@
+<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>My friend cancelled on me for the third time this month and I feel hurt. What should I say to her?<|end_message|><|message_model|>
