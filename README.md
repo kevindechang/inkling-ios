@@ -5,25 +5,26 @@
 - **Published GGUF Weights (Apache 2.0):** [`kevinexus/Inkling-2-FlashPin-26B-GGUF`](https://huggingface.co/kevinexus/Inkling-2-FlashPin-26B-GGUF)
   - File: `inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, `9.39 GiB`, all `128/128` experts retained)
   - SHA-256: `6d856056c0ff323711a487233dc5c63425f1896547803c38aac6c5f39d2acf09`
-- **Raw Verification Artifacts:** [`eval/results/iphone15pro_v35/`](eval/results/iphone15pro_v35/) (every `[tok]`, RAM footprint, `[mmid]`, `[warm_ttft]`, generated text, and thermal reading) + [`eval/results/quality_80item/`](eval/results/quality_80item/) (raw deterministic JSON summaries) + exact prompt files in [`eval/results/iphone15pro_v35/prompts/`](eval/results/iphone15pro_v35/prompts/).
+- **Raw Verification Artifacts:** [`eval/results/iphone15pro_v35/`](eval/results/iphone15pro_v35/) (every `[tok]`, RAM footprint, `[mmid]`, `[warm_ttft]`, generated text, and thermal reading) + [`eval/results/quality_80item/`](eval/results/quality_80item/) (raw deterministic JSON summaries **and all 480 per-example `*_replies.jsonl` model predictions**) + exact prompt files in [`eval/results/iphone15pro_v35/prompts/`](eval/results/iphone15pro_v35/prompts/).
 
 > **Explicit Scope & Lineage (Read Before Judging):**
 > 1. **Base Model & Shape:** Derived from Apache-2.0 [`thinkingmachines/TML-d24-varloop-research`](https://huggingface.co/thinkingmachines/TML-d24-varloop-research) (the 26.4B variable-loop research sibling of Inkling 2, `inkling2_loop`, 24 blocks, 128 experts/layer) — **not** the fixed 3-pass Inkling 2 Mini checkpoint. Distilled and run at **1 loop pass, top-4 experts (`-passes 1 -k 4`)** with **zero experts pruned (`128/128` intact)**.
-> 2. **Same-Artifact Rule:** Every `v35` iPhone 15 Pro speed measurement and every quality measurement in the flagship section below comes from the **exact same single GGUF artifact** (`SHA-256: 6d856056...2acf09`), with `LLAMA_LM_HEAD_SHORTLIST=off` (exact full `200,058`-token vocabulary) unless explicitly marked `LOSSY`.
-> 3. **Harness Requirements:** `ios/` builds `InklingBench`, a minimal **CLI systems benchmark harness** (not a consumer SwiftUI chat app). Building and sideloading on a physical iPhone requires an Apple Developer provisioning profile with the `com.apple.developer.kernel.increased-memory-limit` entitlement.
-> 4. **Total Cloud Compute Spent:** `$46.09 / $60.00` (AWS EC2 L40S for KL sweep + Stage 2/3 distillation; all Phase 2 kernel, router, and iPhone work was `$0` local).
+> 2. **Artifact Identity (`prepack=0` vs `prepack=1`):** Every quality eval and every `prepack=0` iPhone row (`v35a`–`v35d`, `v35_mix`, including the **`23.43 tok/s`** exact-head headline) runs directly on the **published byte-exact GGUF** (`SHA-256: 6d856056c0ff323711a487233dc5c63425f1896547803c38aac6c5f39d2acf09`). The `prepack=1` rows (`v35e`–`v35g`) run on the **logically equivalent, losslessly pre-repacked** layout generated deterministically from that file via `tools/prerepack_exps --pack` (same `10,080,548,288` byte size, mathematically identical weights, bit-reversible via `--unpack` back to `6d856056...2acf09`). All rows use `LLAMA_LM_HEAD_SHORTLIST=off` (exact `200,058`-token vocab) unless explicitly marked `LOSSY`.
+> 3. **Timing Definition (`[warm_ttft]`):** In [`ios/inkling_run.cpp`](ios/inkling_run.cpp), `[warm_ttft]` times `llama_decode` over the 40-token second-turn prompt up through computing the final prompt token's greedy logit (`llama_batch_get_one`), on an already-warm expert cache after `llama_memory_clear`. It does **not** include detokenization (~0.1 ms), app launch, or cold model load — so it is strictly **warm prompt-prefill / first-logit latency**, not cold end-to-end TTFT.
+> 4. **Harness Requirements:** `ios/` builds `InklingBench`, a minimal **CLI systems benchmark harness** (not a consumer SwiftUI chat app). Building and sideloading on a physical iPhone requires an Apple Developer provisioning profile with the `com.apple.developer.kernel.increased-memory-limit` entitlement.
+> 5. **Total Cloud Compute Spent:** `$46.09 / $60.00` (AWS EC2 L40S for KL sweep + Stage 2/3 distillation; all Phase 2 kernel, router, and iPhone work was `$0` local).
 
 ---
 
-## Same-Artifact Summary (`Inkling-2-FlashPin-26B`, `128/128` Experts, `8K Q8_0` KV)
+## Flagship Results (`Inkling-2-FlashPin-26B`, `128/128` Experts, `8K Q8_0` KV)
 
-All rows below measure the **exact same published GGUF** (`inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf`, `128/128` experts, exact `200K` head, `1-pass K=4`):
+All rows below measure **`Inkling-2-FlashPin-26B`** (`128/128` experts, exact `200K` head, `1-pass K=4`): `prepack=0` uses the published GGUF byte-for-byte (`6d856056...2acf09`); `prepack=1` uses its bit-reversible offline-repacked layout.
 
 ### 1. Real iPhone 15 Pro Speed, Context, Memory & Thermals (`v35`)
 
-Flags on every row: `-m models/inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf -ngl 0 -t 2 -tb 4 -ub 64 -passes 1 -k 4 -lm none -lzm on -c 8192 -ctk q8_0 -ctv q8_0`, `GGML_SITU_FAST=accel`, `GGML_MMID_OVERLAP=1`, `GGML_MMID_REPACK=1`, `GGML_MMID_LRU=1`, `GGML_MMID_IO_THREADS=4`, `GGML_MMID_CECAR_PREFILL=1`. `tok/s` is the end-to-end `[gen]` mean over every decode token including cold misses and token 0.
+Flags on every row: `-m models/inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf` (or `-prepack.gguf` when `Prepack=1`) `-ngl 0 -t 2 -tb 4 -ub 64 -passes 1 -k 4 -lm none -lzm on -c 8192 -ctk q8_0 -ctv q8_0`, `GGML_SITU_FAST=accel`, `GGML_MMID_OVERLAP=1`, `GGML_MMID_REPACK=1`, `GGML_MMID_LRU=1`, `GGML_MMID_IO_THREADS=4`, `GGML_MMID_CECAR_PREFILL=1`. `tok/s` is the end-to-end `[gen]` mean over every decode token including cold misses and token 0.
 
-| Run (Raw Log) | Prompt / Gen | Cache / Pin / Route | Head | Prepack | Zero-Miss (`miss=0`) | Med / Mean | Sustained `tok/s` | Warm TTFT (40 tok) | Decode Hit% (`tok1+`) | Peak / Steady RAM | Thermal |
+| Run (Raw Log) | Prompt / Gen | Cache / Pin / Route | Head | Prepack | Zero-Miss (`miss=0`) | Med / Mean | Sustained `tok/s` | Warm Prefill / 1st-Logit (40t) | Decode Hit% (`tok1+`) | Peak / Steady RAM | Thermal |
 |---|---|---|---|:---:|---:|---:|---:|---:|---:|---:|---|
 | **[`v35a`](eval/results/iphone15pro_v35/v35a_c2700_p36_opt95_ub64.log)** | `p_math` (66t) / `200` | `2700 / 36 / OPT λ=0.95` | **exact** | `0` | `31 ms` (14) | `39 / 43 ms` | **`23.43`** | **`0.978 s`** (`40.9 t/s`) | `89.8%` (`95.3%`) | **`4,081 / 3,945 MB`** | `nominal → nominal` |
 | **[`v35d`](eval/results/iphone15pro_v35/v35d_c2950_p40_c035_ub64.log)** | `p_math` (66t) / `200` | `2950 / 40 / CECAR=0.35` | **exact** | `0` | `34 ms` (31) | `42 / 46 ms` | **`21.78`** | **`0.761 s`** (`52.6 t/s`) | `91.6%` (`97.4%`) | `4,334 / 4,187 MB` | `nominal → nominal` |
@@ -40,38 +41,39 @@ Flags on every row: `-m models/inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf -ngl
   - On single-topic reasoning (`p_math`), sustained throughput is **`21.20–23.43 tok/s`** (`375`-tok natural completion to EOG / `200`-tok run). On the deliberately adversarial 3-topic domain-switching prompt (`v34_mix`: math + physics + Python in one turn), flash misses increase and sustained 400-tok throughput is **`18.36 tok/s`** (`+5.2%` over unpacked `17.46 tok/s`).
   - Offline pre-repacking (`GGML_MMID_PREREPACKED=1`) zeroes `repack_ms` (`437.8–906.9 ms → 0.0 ms` in decode, `800.8–1,780.4 ms → 0.0 ms` in prefill) and speeds up prefill (`5.17 → 4.14–4.50 s`) and miss-heavy mixed-domain decode (`17.46 → 18.36 tok/s`), while async `CECAR` cache-timing variance kept unpacked `v35a` slightly ahead on the 200-tok single-topic run (`23.43` vs `22.05 tok/s`).
 
-### 2. Quality on the Exact Same Artifact (`N=80` Deterministic Code-Scored Suite + `N=236` Baseline)
+### 2. Quality on the Published Unpacked GGUF (`N=80` Deterministic Subset + `N=236` Baseline)
 
-All benchmarks use deterministic public code-scored datasets ([`eval/suite_spec.json`](eval/suite_spec.json); coding and obscure trivia excluded). Because the 80-item fast suite has small per-task counts (`15` GSM8K-Hard, `10` MATH-500, `10` Logic, `10` GPQA Diamond, `20` BFCL, `15` IFEval), exact fractions are reported alongside percentages. Raw JSONs live in [`eval/results/quality_80item/`](eval/results/quality_80item/).
+All benchmarks use deterministic public code-scored datasets ([`eval/suite_spec.json`](eval/suite_spec.json); coding and obscure trivia excluded). Because the 80-item dev suite has small per-task counts (`15` GSM8K-Hard, `10` MATH-500, `10` Logic, `10` GPQA Diamond, `20` BFCL, `15` IFEval), exact fractions are reported alongside percentages and **per-example predictions (`*_replies.jsonl`) + aggregate JSONs are committed in [`eval/results/quality_80item/`](eval/results/quality_80item/)**. *(Note: the full 3-pass `K=8` reference row only has matched per-task scores for `GSM8K`, `BFCL`, and `IFEval`; do not divide different composite denominators across rows.)*
 
-| Routing Mode (Same GGUF, `128/128` Experts) | Think Cap / Effort | `GSM8K-Hard` | `MATH-500` | `Logic` | `GPQA` | `BFCL` | `IFEval` | Mean (`N=80`) | Avg Think | Cache Hit (`3000 MB`) |
+| Routing Mode (`prepack=0` GGUF, `128/128` Experts) | Think Cap / Effort | `GSM8K-Hard` | `MATH-500` | `Logic` | `GPQA` | `BFCL` | `IFEval` | 6-Task Mean (`N=80`) | Avg Think | Cache Hit (`3000 MB`) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| *Ref: Full 3-pass `K=8` BF16/MLX (53 GB, Mac)* | *ref* | `95.0%` | — | — | — | `100.0%` | `70.0%` | *`65.0%`* | — | — |
+| *Ref: Full 3-pass `K=8` BF16/MLX (53 GB, Mac)* | *ref* | `95.0%` | — | — | — | `100.0%` | `70.0%` | *— (diff. denom.)* | — | — |
 | *Ref: 1-pass `K=4` `stage2-v1 + run3` (`N=236`)* | *uncapped* | `83.3%` *(25/30)* | `60.0%` *(18/30)* | `20.0%` *(6/30)* | `16.7%` *(5/30)* | `85.5%` *(65/76)* | `52.5%` *(21/40)* | — | `~650` | `~85–90%` |
-| **[`c000_sc320`](eval/results/quality_80item/c000_sc320.json)** (`CECAR=0`, max quality) | `cap=320`, `e=0.2` | `60.0%` *(9/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `10.0%` *(1/10)* | **`80.0%`** *(16/20)* | **`66.7%`** *(10/15)* | **`59.3%`** | `245` | `75.3%` |
-| **[`opt95_e045`](eval/results/quality_80item/opt95_e045.json)** (`OPT λ=0.95`, same route as `v35a`) | uncapped, `e=0.45` | **`73.3%`** *(11/15)* | `30.0%` *(3/10)* | `20.0%` *(2/10)* | `20.0%` *(2/10)* | **`75.0%`** *(15/20)* | `46.7%` *(7/15)* | **`53.9%`** | `761` | `90.6%` |
-| **[`opt95_e020`](eval/results/quality_80item/opt95_e020.json)** (`OPT λ=0.95`, same route as `v35a`) | uncapped, `e=0.20` | **`80.0%`** *(12/15)* | **`40.0%`** *(4/10)* | `20.0%` *(2/10)* | `0.0%` *(0/10)* | `60.0%` *(12/20)* | **`60.0%`** *(9/15)* | **`53.3%`** | `774` | `91.8%` |
-| [`opt85_sc320`](eval/results/quality_80item/opt85_sc320.json) (`OPT λ=0.85`) | `cap=320`, `e=0.2` | `60.0%` *(9/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `30.0%` *(3/10)* | `60.0%` *(12/20)* | `60.0%` *(9/15)* | `51.9%` | `250` | `90.2%` |
-| [`opt95_sc320`](eval/results/quality_80item/opt95_sc320.json) (`OPT λ=0.95`, concise) | `cap=320`, `e=0.2` | `73.3%` *(11/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `30.0%` *(3/10)* | `60.0%` *(12/20)* | `46.7%` *(7/15)* | `48.9%` | `249` | **`92.2%`** |
-| `S2V1-Run3-Merged` (`CECAR=0.35`, same route as `v35d`) | `cap=384` | `73.3%` *(11/15)* | `30.0%` *(3/10)* | `6.7%` *(1/15)* | `26.7%` *(4/15)* | `70.0%` *(21/30)* | `55.0%` *(11/20)* | — | `351–381` | `95.3–96.5%` |
-| [`fmrd_v2_sc320`](eval/results/quality_80item/fmrd_v2_sc320.json) (distilled routers, `CECAR=0`) | `cap=320`, `e=0.2` | `46.7%` *(7/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `20.0%` *(2/10)* | `70.0%` *(14/20)* | `46.7%` *(7/15)* | `48.5%` | `262` | `84.2%` |
+| [`c000_sc320`](eval/results/quality_80item/c000_sc320.json) ([`replies`](eval/results/quality_80item/c000_sc320_replies.jsonl)) (`CECAR=0`) | `cap=320`, `e=0.2` | `60.0%` *(9/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `10.0%` *(1/10)* | **`80.0%`** *(16/20)* | **`66.7%`** *(10/15)* | **`59.3%`** | `245` | `75.3%` |
+| [`opt95_e045`](eval/results/quality_80item/opt95_e045.json) ([`replies`](eval/results/quality_80item/opt95_e045_replies.jsonl)) (`OPT λ=0.95`, `v35a` route) | uncapped, `e=0.45` | **`73.3%`** *(11/15)* | `30.0%` *(3/10)* | `20.0%` *(2/10)* | `20.0%` *(2/10)* | **`75.0%`** *(15/20)* | `46.7%` *(7/15)* | **`53.9%`** | `761` | `90.6%` |
+| [`opt95_e020`](eval/results/quality_80item/opt95_e020.json) ([`replies`](eval/results/quality_80item/opt95_e020_replies.jsonl)) (`OPT λ=0.95`, `v35a` route) | uncapped, `e=0.20` | **`80.0%`** *(12/15)* | **`40.0%`** *(4/10)* | `20.0%` *(2/10)* | `0.0%` *(0/10)* | `60.0%` *(12/20)* | **`60.0%`** *(9/15)* | **`53.3%`** | `774` | `91.8%` |
+| [`opt85_sc320`](eval/results/quality_80item/opt85_sc320.json) ([`replies`](eval/results/quality_80item/opt85_sc320_replies.jsonl)) (`OPT λ=0.85`) | `cap=320`, `e=0.2` | `60.0%` *(9/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `30.0%` *(3/10)* | `60.0%` *(12/20)* | `60.0%` *(9/15)* | `51.9%` | `250` | `90.2%` |
+| [`opt95_sc320`](eval/results/quality_80item/opt95_sc320.json) ([`replies`](eval/results/quality_80item/opt95_sc320_replies.jsonl)) (`OPT λ=0.95`, concise) | `cap=320`, `e=0.2` | `73.3%` *(11/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `30.0%` *(3/10)* | `60.0%` *(12/20)* | `46.7%` *(7/15)* | `48.9%` | `249` | **`92.2%`** |
+| `S2V1-Run3-Merged` (`CECAR=0.35`, `v35d` route) | `cap=384` | `73.3%` *(11/15)* | `30.0%` *(3/10)* | `6.7%` *(1/15)* | `26.7%` *(4/15)* | `70.0%` *(21/30)* | `55.0%` *(11/20)* | — | `351–381` | `95.3–96.5%` |
+| [`fmrd_v2_sc320`](eval/results/quality_80item/fmrd_v2_sc320.json) ([`replies`](eval/results/quality_80item/fmrd_v2_sc320_replies.jsonl)) (`CECAR=0`) | `cap=320`, `e=0.2` | `46.7%` *(7/15)* | `30.0%` *(3/10)* | `10.0%` *(1/10)* | `20.0%` *(2/10)* | `70.0%` *(14/20)* | `46.7%` *(7/15)* | `48.5%` | `262` | `84.2%` |
 
-- **Honest Quality Tradeoff:**
-  - At `CECAR=0`, this single 1-pass `128e` GGUF reaches **`59.3%` mean** (`~91%` of the full 3-pass 53 GB model's `65.0%` composite: `80.0%` BFCL, `66.7%` IFEval) at `245` avg think tokens.
-  - Enabling `OPT λ=0.95` or `CECAR=0.35` cuts flash misses `~3×` (enabling `21–23.4 tok/s` on iPhone 15 Pro) while retaining `73.3–80.0%` GSM8K-Hard, `30–40%` MATH-500, and `~82–83%` of full-model mean uncapped (`53.3–53.9%`), but **introduces a `-15 to -20%` `BFCL` sensitivity** when paired with `cap=320`. Because tool calls only emit `20–50` tokens, disabling `CECAR` on tool-schema turns preserves `80%` `BFCL` for `< 0.5 s` extra latency.
-  - Hard multi-step `Logic` (`10–20%`) and `MATH-500` (`30–40%`) remain the largest gap from cutting 3 loop passes → 1 pass + `Q2_K` quantization.
+- **Honest Quality Assessment & Limitations:**
+  - **Quality remains the biggest technical gap.** Moving from 3 loop passes (`K=8`, 53 GB BF16) to 1 pass (`K=4`, 9.39 GiB mixed `Q2_K`/`Q4_0`) leaves multi-step **`Logic` (`10–20%`, `N=10`)**, **`GPQA` (`0–30%`, `N=10`)**, and **`MATH-500` (`30–40%`, `N=10`)** weak and high-variance due to the small `N=10` subsets.
+  - **Where quality holds up best (matched per-task):** `GSM8K-Hard` (`73.3–80.0%` vs `95%` 3p ref / `83.3%` 1p `N=30`), `BFCL` (`80.0%` at `CECAR=0` vs `100%` 3p ref / `85.5%` 1p `N=76`), and `IFEval` (`60.0–66.7%` vs `70%` 3p ref / `52.5%` 1p `N=40`).
+  - **`CECAR` vs `BFCL` tradeoff:** Enabling `OPT λ=0.95` or `CECAR=0.35` cuts flash misses `~3×` (enabling `21–23.4 tok/s` on iPhone 15 Pro), but drops `BFCL` from `80% → 60–75%`. On short tool-calling turns (`20–50` output tokens), disabling `CECAR` recovers `80%` `BFCL` for `< 0.5 s` extra latency.
+  - **Scoring reproducibility:** Our internal scoring wrapper is not mirrored in this repo, so we publish [`eval/suite_spec.json`](eval/suite_spec.json), the aggregate JSONs, and all **480 raw per-example predictions (`*_replies.jsonl`)** with item IDs so third parties can inspect or re-score every output directly.
 
 ---
 
 ## Targets & Measured Results
 
-| Goal | Target | Verified Same-Artifact Result (`Inkling-2-FlashPin-26B`, `128/128` Experts) | Status |
+| Goal | Target | Verified Result (`Inkling-2-FlashPin-26B`, `128/128` Experts) | Status |
 |---|---|---|---|
-| **Sustained decode** | **`>= 20 tok/s`** (`<= 50 ms/tok` mean) | **`23.43 tok/s`** (`v35a`, 200 tok, exact head); **`21.20 tok/s`** (`v35f`, 375 tok EOG); **`21.78 tok/s`** (`v35d`, `CECAR=0.35`); **`18.36 tok/s`** (`v35f_mix`, 400-tok 3-topic domain switch) | **Met on single-topic (`21.2–23.4 t/s`); `18.4 t/s` on 3-topic mix** |
-| **Warm TTFT** | **`<= 2.0 s`** | **`0.761 s`** (`52.6 tok/s`, `v35d`, 40-tok Turn-2) / **`0.978 s`** (`40.9 tok/s`, `v35a`) | **Met (`< 1.0 s`)** |
+| **Sustained decode** | **`>= 20 tok/s`** (`<= 50 ms/tok` mean) | **`23.43 tok/s`** (`v35a`, 200t, `prepack=0`, exact head); **`21.78 tok/s`** (`v35d`, `CECAR=0.35`, `prepack=0`); **`21.20 tok/s`** (`v35f`, 375t EOG, `prepack=1`); **`18.36 tok/s`** (`v35f_mix`, 400t 3-topic switch, `prepack=1`) | **Met on single-topic (`21.2–23.4 t/s`); `18.4 t/s` on 3-topic mix** |
+| **Warm Prefill / 1st-Logit** | **`<= 2.0 s`** | **`0.761 s`** (`52.6 tok/s`, `v35d`, 40t Turn-2 prefill + final logit) / **`0.978 s`** (`40.9 tok/s`, `v35a`) *(excludes ~0.1 ms detokenize & cold load)* | **Met (`< 1.0 s` warm prefill/1st-logit)** |
 | **Context window** | **`8K`** at `>= 20 tok/s` | **`8K` (`Q8_0` KV)** verified on every `v35` row (`3,922–4,364 MB` peak); **`16K`** also proven (`v29`) | **Met (`8K Q8_0` on every `v35` run)** |
 | **Memory & Thermal** | **`<= 4.5 GB`** (`nominal`) | **`3,945–4,225 MB`** steady (`4,062–4,364 MB` peak, `-ub 64`), **`nominal → nominal`** on all 9 `v35` runs (iOS compressor cliff mapped at `~4,450 MB`) | **Met with `~100–400 MB` margin** |
-| **Quality** | Reasoning / tool-use / writing intact | `~82–83%` of full 3-pass model under `OPT λ=0.95` (`73–80%` GSM8K, `30–40%` MATH-500, `60–75%` BFCL, `47–60%` IFEval); `~91%` at `CECAR=0` (`80%` BFCL, `66.7%` IFEval) | **Strong on GSM8K/BFCL/IFEval; Logic/MATH-500 show 1p gap** |
+| **Quality** | Reasoning / tool-use / writing intact | `GSM8K 73–80%`, `BFCL 60–80%`, `IFEval 47–67%`, `MATH-500 30–40%`, `Logic 10–20%`, `GPQA 0–30%` (`N=80`; raw predictions published) | **Strong on GSM8K/BFCL/IFEval; Logic/GPQA/MATH-500 remain the main gap** |
 | **Concise thinking** | `~150–350` tok | `245–296` tok (`soft_cap=320`) / `351–381` tok (`cap=384`) vs `600–1,100` tok baseline | **Met (`-55–65%` think tokens)** |
 
 ---

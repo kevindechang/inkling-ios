@@ -7,24 +7,24 @@ All quality benchmarks use deterministic public code-scored datasets ([`eval/sui
 
 Coding (`HumanEval`, `SWEBench`) and obscure trivia (`SimpleQA`, `SuperGPQA`, `HLE`) are intentionally excluded.
 
-**Published Same-Artifact GGUF:** [`kevinexus/Inkling-2-FlashPin-26B-GGUF`](https://huggingface.co/kevinexus/Inkling-2-FlashPin-26B-GGUF) — `inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, SHA-256 `6d856056c0ff323711a487233dc5c63425f1896547803c38aac6c5f39d2acf09`, all `128/128` experts intact, derived from `thinkingmachines/TML-d24-varloop-research` distilled to 1-pass `K=4`).
+**Published GGUF (`prepack=0`):** [`kevinexus/Inkling-2-FlashPin-26B-GGUF`](https://huggingface.co/kevinexus/Inkling-2-FlashPin-26B-GGUF) — `inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, SHA-256 `6d856056c0ff323711a487233dc5c63425f1896547803c38aac6c5f39d2acf09`, all `128/128` experts intact, derived from `thinkingmachines/TML-d24-varloop-research` distilled to 1-pass `K=4`). Rows marked `Prepack=1` (`v35e`–`v35g`) use the logically equivalent, bit-reversible offline-repacked layout generated from that file via `tools/prerepack_exps --pack`.
 
 ---
 
 ## 1. Public Quality Scoreboard & Cache-Hit Pareto Frontier
 
-### 1a. Same-Artifact Deterministic 80-Item Suite (`Inkling-2-FlashPin-26B`, `128/128` Experts)
+### 1a. Deterministic 80-Item Suite (`prepack=0` GGUF, `128/128` Experts)
 
-Subset: 15 `GSM8K-Hard`, 10 `MATH-500`, 10 `Logic`, 10 `GPQA Diamond`, 20 `BFCL`, 15 `IFEval` (`N=80`). Raw JSON outputs are committed in [`quality_80item/`](quality_80item/). Cache hit is each run's `[mmid]` tail at `3000 MB` budget / `PIN=32`. `OPT` arms use `cecar_bonus=1.0` with the 24-layer sensitivity schedule; `c000` and `fmrd_v2` use `cecar_bonus=0`.
+Subset: 15 `GSM8K-Hard`, 10 `MATH-500`, 10 `Logic`, 10 `GPQA Diamond`, 20 `BFCL`, 15 `IFEval` (`N=80`). Aggregate JSONs and all **480 raw per-example predictions (`*_replies.jsonl`)** are committed in [`quality_80item/`](quality_80item/). Cache hit is each run's `[mmid]` tail at `3000 MB` budget / `PIN=32`. `OPT` arms use `cecar_bonus=1.0` with the 24-layer sensitivity schedule; `c000` and `fmrd_v2` use `cecar_bonus=0`.
 
-| Arm (Raw JSON) | Think Cap / Effort | `GSM8K-Hard` | `MATH-500` | `Logic` | `GPQA` | `BFCL` | `IFEval` | Reas | Mean | Avg Think (`all / reas`) | Cache Hit |
+| Arm (JSON / Predictions) | Think Cap / Effort | `GSM8K-Hard` | `MATH-500` | `Logic` | `GPQA` | `BFCL` | `IFEval` | Reas | Mean | Avg Think (`all / reas`) | Cache Hit |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| [`c000_sc320`](quality_80item/c000_sc320.json) (`CECAR=0`) | `cap=320`, `e=0.20` | `60.0%` (9/15) | `30.0%` (3/10) | `10.0%` (1/10) | `10.0%` (1/10) | **`80.0%`** (16/20) | **`66.7%`** (10/15) | `31.1%` | **`59.3%`** | `245 / 293` | `75.3%` |
-| [`opt95_e045`](quality_80item/opt95_e045.json) (`OPT λ=0.95`) | uncapped, `e=0.45` | **`73.3%`** (11/15) | `30.0%` (3/10) | `20.0%` (2/10) | `20.0%` (2/10) | **`75.0%`** (15/20) | `46.7%` (7/15) | **`40.0%`** | **`53.9%`** | `761 / 857` | `90.6%` |
-| [`opt95_e020`](quality_80item/opt95_e020.json) (`OPT λ=0.95`) | uncapped, `e=0.20` | **`80.0%`** (12/15) | **`40.0%`** (4/10) | `20.0%` (2/10) | `0.0%` (0/10) | `60.0%` (12/20) | **`60.0%`** (9/15) | **`40.0%`** | **`53.3%`** | `774 / 780` | `91.8%` |
-| [`opt85_sc320`](quality_80item/opt85_sc320.json) (`OPT λ=0.85`) | `cap=320`, `e=0.20` | `60.0%` (9/15) | `30.0%` (3/10) | `10.0%` (1/10) | `30.0%` (3/10) | `60.0%` (12/20) | `60.0%` (9/15) | `35.6%` | `51.9%` | `250 / 294` | `90.2%` |
-| [`opt95_sc320`](quality_80item/opt95_sc320.json) (`OPT λ=0.95`) | `cap=320`, `e=0.20` | `73.3%` (11/15) | `30.0%` (3/10) | `10.0%` (1/10) | `30.0%` (3/10) | `60.0%` (12/20) | `46.7%` (7/15) | **`40.0%`** | `48.9%` | `249 / 293` | **`92.2%`** |
-| [`fmrd_v2_sc320`](quality_80item/fmrd_v2_sc320.json) (`CECAR=0`) | `cap=320`, `e=0.20` | `46.7%` (7/15) | `30.0%` (3/10) | `10.0%` (1/10) | `20.0%` (2/10) | `70.0%` (14/20) | `46.7%` (7/15) | `28.9%` | `48.5%` | `262 / 296` | `84.2%` |
+| [`c000_sc320`](quality_80item/c000_sc320.json) ([`replies`](quality_80item/c000_sc320_replies.jsonl)) (`CECAR=0`) | `cap=320`, `e=0.20` | `60.0%` (9/15) | `30.0%` (3/10) | `10.0%` (1/10) | `10.0%` (1/10) | **`80.0%`** (16/20) | **`66.7%`** (10/15) | `31.1%` | **`59.3%`** | `245 / 293` | `75.3%` |
+| [`opt95_e045`](quality_80item/opt95_e045.json) ([`replies`](quality_80item/opt95_e045_replies.jsonl)) (`OPT λ=0.95`) | uncapped, `e=0.45` | **`73.3%`** (11/15) | `30.0%` (3/10) | `20.0%` (2/10) | `20.0%` (2/10) | **`75.0%`** (15/20) | `46.7%` (7/15) | **`40.0%`** | **`53.9%`** | `761 / 857` | `90.6%` |
+| [`opt95_e020`](quality_80item/opt95_e020.json) ([`replies`](quality_80item/opt95_e020_replies.jsonl)) (`OPT λ=0.95`) | uncapped, `e=0.20` | **`80.0%`** (12/15) | **`40.0%`** (4/10) | `20.0%` (2/10) | `0.0%` (0/10) | `60.0%` (12/20) | **`60.0%`** (9/15) | **`40.0%`** | **`53.3%`** | `774 / 780` | `91.8%` |
+| [`opt85_sc320`](quality_80item/opt85_sc320.json) ([`replies`](quality_80item/opt85_sc320_replies.jsonl)) (`OPT λ=0.85`) | `cap=320`, `e=0.20` | `60.0%` (9/15) | `30.0%` (3/10) | `10.0%` (1/10) | `30.0%` (3/10) | `60.0%` (12/20) | `60.0%` (9/15) | `35.6%` | `51.9%` | `250 / 294` | `90.2%` |
+| [`opt95_sc320`](quality_80item/opt95_sc320.json) ([`replies`](quality_80item/opt95_sc320_replies.jsonl)) (`OPT λ=0.95`) | `cap=320`, `e=0.20` | `73.3%` (11/15) | `30.0%` (3/10) | `10.0%` (1/10) | `30.0%` (3/10) | `60.0%` (12/20) | `46.7%` (7/15) | **`40.0%`** | `48.9%` | `249 / 293` | **`92.2%`** |
+| [`fmrd_v2_sc320`](quality_80item/fmrd_v2_sc320.json) ([`replies`](quality_80item/fmrd_v2_sc320_replies.jsonl)) (`CECAR=0`) | `cap=320`, `e=0.20` | `46.7%` (7/15) | `30.0%` (3/10) | `10.0%` (1/10) | `20.0%` (2/10) | `70.0%` (14/20) | `46.7%` (7/15) | `28.9%` | `48.5%` | `262 / 296` | `84.2%` |
 
 ### 1b. Larger Baselines, Reference Models & Stage 3 WSD-40 Ablation
 
@@ -63,9 +63,9 @@ Subset: 15 `GSM8K-Hard`, 10 `MATH-500`, 10 `Logic`, 10 `GPQA Diamond`, 20 `BFCL`
 
 ### 2a. `v35` Flagship Sweep — Full `128/128` Experts, Exact `200K` Head, `-ub 64`, `GGML_SITU_FAST=accel`
 
-Every row uses the exact published artifact (`SHA-256: 6d856056...2acf09`) with `-c 8192 -ctk q8_0 -ctv q8_0 -passes 1 -k 4 -lm none -lzm on -t 2 -tb 4 -ub 64`, overlap, repack, LRU, 4 IO threads, and CECAR prefill. Raw sanitized per-token logs and prompts are committed under [`iphone15pro_v35/`](iphone15pro_v35/).
+`Prepack=0` rows (`v35a`–`v35d`, `v35_mix`) run directly on the published byte-exact GGUF (`SHA-256: 6d856056...2acf09`); `Prepack=1` rows (`v35e`–`v35g`) run on its bit-reversible offline-repacked layout (`tools/prerepack_exps --pack`). All rows use `-c 8192 -ctk q8_0 -ctv q8_0 -passes 1 -k 4 -lm none -lzm on -t 2 -tb 4 -ub 64`, overlap, repack, LRU, 4 IO threads, and CECAR prefill. Note: `[warm_ttft]` measures warm prompt-prefill through computing the final prompt token's greedy logit (`llama_batch_get_one`) after `llama_memory_clear` (excludes ~0.1 ms detokenization & cold load). Raw sanitized per-token logs and prompts are committed under [`iphone15pro_v35/`](iphone15pro_v35/).
 
-| Run (Raw Log) | Prompt / Gen | Cache / Pin / Route | Head | Prepack | Zero-Miss (n) | Med / Mean ms | `tok/s` | Warm TTFT (40t) | Hit% (`tok1+`) | Decode Wait / Repack ms | Peak / Steady MB | Thermal |
+| Run (Raw Log) | Prompt / Gen | Cache / Pin / Route | Head | Prepack | Zero-Miss (n) | Med / Mean ms | `tok/s` | Warm Prefill / 1st-Logit (40t) | Hit% (`tok1+`) | Decode Wait / Repack ms | Peak / Steady MB | Thermal |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | **[`v35a`](iphone15pro_v35/v35a_c2700_p36_opt95_ub64.log)** | `p_math` (66t) / `200` | `2700 / 36 / λ=0.95` | exact | 0 | `31` (14) | `39 / 43` | **`23.43`** | `0.978 s` | `89.8%` (`95.3%`) | `2187.6 / 437.8` | `4081 / 3945` | `nominal → nominal` |
 | [`v35b`](iphone15pro_v35/v35b_c2950_p40_opt95_ub64.log) | `p_math` (66t) / `200` | `2950 / 40 / λ=0.95` | exact | 0 | `32` (12) | `43 / 48` | `20.78` | `0.992 s` | `90.2%` (`95.7%`) | `2140.2 / 602.9` | `4334 / 4187` | `nominal → nominal` |
