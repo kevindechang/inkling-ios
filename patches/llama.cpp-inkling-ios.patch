@@ -687,19 +687,19 @@ index f8b3637..4cf1246 100644
  
  void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
  int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
-+// sage-lab thread scaling (runs/speed/THREAD_SCALING.md): env GGML_CPU_FINE_CHUNKS=1, read once
++// inkling-ios thread scaling (runs/speed/THREAD_SCALING.md): env GGML_CPU_FINE_CHUNKS=1, read once
 +bool ggml_cpu_fine_chunks(void);
 +// GGML_CPU_EMU_SLOW measurement aid: returns 0 unless this thread is an emulated slow one
 +int64_t ggml_cpu_emu_now(const struct ggml_compute_params * params);
 +void    ggml_cpu_emu_stretch(int64_t t0);
-+// sage-lab mmid cache repack (GGML_MMID_REPACK=1 same-size, =2 + IQ1_S/IQ2_* unpack)
++// inkling-ios mmid cache repack (GGML_MMID_REPACK=1 same-size, =2 + IQ1_S/IQ2_* unpack)
 +size_t  ggml_mmid_repack_info(enum ggml_type type, int64_t ne0, int64_t ne1, int mode, int * out_nb_cols);
 +void    ggml_mmid_repack_slice(enum ggml_type type, int64_t ne0, int64_t ne1, void * dst, const void * src, size_t src_size);
 +void    ggml_mmid_repack_gemv(enum ggml_type type, int64_t ne0, int64_t ne1,
 +                              const void * repacked_slice, int64_t ir0_start, int64_t ir0_end,
 +                              const void * src1_col, float * dst_col);
 +const struct ggml_cpu_lm_head_ops * ggml_cpu_lm_head_get_ops(void);
-+// sage-lab CECAR decoupled cache-bonus routing (env GGML_MMID_CECAR_BONUS, default 0)
++// inkling-ios CECAR decoupled cache-bonus routing (env GGML_MMID_CECAR_BONUS, default 0)
 +float ggml_cpu_mmid_cecar_bonus(void);
 +bool  ggml_cpu_mmid_is_cached(const char * base, size_t nb2, int expert);
 +void  ggml_cpu_mmid_cecar_note(int n_swaps);
@@ -707,7 +707,7 @@ index f8b3637..4cf1246 100644
  #ifdef __cplusplus
  }
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 33193a5..0d567a2 100644
+index 33193a5..0735b85 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -15,6 +15,9 @@
@@ -751,7 +751,7 @@ index 33193a5..0d567a2 100644
 +    ggml_barrier_impl(tp);
 +}
 +
-+// Thread scaling switches (sage-lab, runs/speed/THREAD_SCALING.md). All off by default, each read once.
++// Thread scaling switches (inkling-ios, runs/speed/THREAD_SCALING.md). All off by default, each read once.
 +//   GGML_CPU_FINE_CHUNKS=1  matmuls never fall back to one static slice per thread; rows go out in small chunks that
 +//                           threads take dynamically, so a slow core never holds a whole slice (lossless: rows are
 +//                           only regrouped, each row is still one full dot product)
@@ -872,11 +872,11 @@ index 33193a5..0d567a2 100644
  
          if (nth >= nchunk0 * nchunk1) {
              break;
-@@ -1509,6 +1631,782 @@ UseGgmlGemm2:;
+@@ -1509,6 +1631,790 @@ UseGgmlGemm2:;
      }
  }
  
-+// Expert cache (sage-lab, inkling-phone): env GGML_MMID_CACHE_MB > 0 keeps the expert slices used by mul_mat_id
++// Expert cache (inkling-ios, inkling-phone): env GGML_MMID_CACHE_MB > 0 keeps the expert slices used by mul_mat_id
 +// in anonymous memory (LRU, byte budget), so a memory-mapped expert tensor is read from the file once per miss
 +// instead of depending on the OS page cache. Filled by thread 0 before the barrier; ops run one at a time.
 +#define MMID_CACHE_SLOTS 16384
@@ -1047,7 +1047,7 @@ index 33193a5..0d567a2 100644
 +    mmid_n_pending = 0;
 +}
 +
-+// Atomic Engine port (sage-lab, 2026-11-24; Atomic Engine is MIT). Each part is off by default, read once at init:
++// Atomic Engine port (inkling-ios, 2026-11-24; Atomic Engine is MIT). Each part is off by default, read once at init:
 +//   GGML_MMID_OVERLAP=1   known-route overlap: the op's misses go to an urgent queue and the paired down slices to a low queue
 +//                         of 2 reader threads; compute runs the resident experts first and waits only for its own misses
 +//   GGML_MMID_LRU=1       O(1) LRU, one list per slice size so a victim's buffer is reused in place;  =2 ClassLRU
@@ -1077,10 +1077,10 @@ index 33193a5..0d567a2 100644
 +#define MMID_ALIGN      16384
 +#define MMID_BYPASS_MIN_TOKENS 512
 +
-+static int mmid_overlap = 0, mmid_lru = 0, mmid_coalesce = 0;
++static int mmid_overlap = 0, mmid_lru = 0, mmid_coalesce = 0, mmid_pin_n = 0;
 +static uint64_t mmid_pf_issued = 0, mmid_pf_used = 0, mmid_pf_wasted = 0, mmid_bypass_reads = 0;
 +
-+static bool mmid_port_active(void) { return mmid_overlap || mmid_lru || mmid_coalesce; }
++static bool mmid_port_active(void) { return mmid_overlap || mmid_lru || mmid_coalesce || mmid_pin_n > 0; }
 +
 +// ---- reader threads: urgent and low queues, adapted from Atomic Engine src/llama-expert-read-pool.h (early_io::pool)
 +struct mmid_task { struct mmid_task * next; struct mmid_cache_entry * e[MMID_GROUP_MAX]; int n; bool urgent, queued; };
@@ -1300,7 +1300,7 @@ index 33193a5..0d567a2 100644
 +}
 +
 +static bool mmid_evictable(const struct mmid_cache_entry * e) {
-+    return e->buf && e->pins == 0 && atomic_load_explicit(&e->state, memory_order_acquire) != MMID_LOADING;
++    return e->buf && e->pins == 0 && !(mmid_pin_n > 0 && e->expert >= 0 && e->expert < mmid_pin_n) && atomic_load_explicit(&e->state, memory_order_acquire) != MMID_LOADING;
 +}
 +
 +static struct mmid_cache_entry * mmid_oldest_unpinned(int list) {
@@ -1316,6 +1316,13 @@ index 33193a5..0d567a2 100644
 +        for (size_t j = 0; j < MMID_CACHE_SLOTS; j++) {
 +            const struct mmid_cache_entry * c = &mmid_cache[j];
 +            if (c->buf && c->tick + 1024 < mmid_cache_tick && mmid_evictable(c) && (!chosen || c->tick < chosen->tick)) { chosen = &mmid_cache[j]; }
++        }
++        if (!chosen && mmid_pin_n > 0) {
++            // Cold ring fallback: evict oldest non-pinned cold expert immediately so hot experts never overflow budget
++            for (size_t j = 0; j < MMID_CACHE_SLOTS; j++) {
++                const struct mmid_cache_entry * c = &mmid_cache[j];
++                if (c->buf && mmid_evictable(c) && (!chosen || c->tick < chosen->tick)) { chosen = &mmid_cache[j]; }
++            }
 +        }
 +        return chosen;
 +    }
@@ -1606,9 +1613,9 @@ index 33193a5..0d567a2 100644
 +void ggml_cpu_mmid_stats_dump(void) {
 +    if (!mmid_stats_on) return;
 +    mmid_stats_on = 0;
-+    fprintf(stderr, "[mmid] overlap=%d lru=%d coalesce=%d repack=%d budget_mb=%zu hits=%llu misses=%llu read_mb=%.1f read_calls=%llu wait_ms=%.1f "
++    fprintf(stderr, "[mmid] overlap=%d lru=%d coalesce=%d repack=%d pin_n=%d budget_mb=%zu hits=%llu misses=%llu read_mb=%.1f read_calls=%llu wait_ms=%.1f "
 +        "prefetch_issued=%llu prefetch_used=%llu prefetch_wasted=%llu bypass_reads=%llu repacked=%llu repack_ms=%.1f cecar_bonus=%.4f cecar_calls=%llu cecar_swaps=%llu\n",
-+        mmid_overlap, mmid_lru, mmid_coalesce, mmid_repack_mode, mmid_cache_budget >> 20, (unsigned long long) mmid_cache_hits, (unsigned long long) mmid_cache_misses,
++        mmid_overlap, mmid_lru, mmid_coalesce, mmid_repack_mode, mmid_pin_n, mmid_cache_budget >> 20, (unsigned long long) mmid_cache_hits, (unsigned long long) mmid_cache_misses,
 +        (double) atomic_load(&mmid_read_bytes) / 1048576.0, (unsigned long long) atomic_load(&mmid_read_calls), mmid_wait_us / 1000.0,
 +        (unsigned long long) mmid_pf_issued, (unsigned long long) mmid_pf_used, (unsigned long long) mmid_pf_wasted, (unsigned long long) mmid_bypass_reads,
 +        (unsigned long long) atomic_load(&mmid_repacked_slices), (double) atomic_load(&mmid_repack_us) / 1000.0,
@@ -1629,6 +1636,7 @@ index 33193a5..0d567a2 100644
 +    mmid_overlap = mmid_env("GGML_MMID_OVERLAP") == 1;
 +    mmid_lru = mmid_env("GGML_MMID_LRU"); if (mmid_lru < 0 || mmid_lru > 2) { mmid_lru = 0; }
 +    mmid_coalesce = mmid_env("GGML_MMID_COALESCE") == 1;
++    mmid_pin_n = mmid_env("GGML_MMID_PIN_N"); if (mmid_pin_n < 0) { mmid_pin_n = 0; }
 +    mmid_stats_on = mmid_env("GGML_MMID_STATS") == 1;
 +    if (mmid_overlap) {
 +        for (int i = MMID_TASKS - 1; i >= 0; i--) { mmid_io.tasks[i].next = mmid_io.free_list; mmid_io.free_list = &mmid_io.tasks[i]; }
@@ -1655,7 +1663,7 @@ index 33193a5..0d567a2 100644
  // ggml_compute_forward_mul_mat_id
  
  #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
-@@ -1704,7 +2602,28 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1704,7 +2610,28 @@ static void ggml_compute_forward_mul_mat_id(
                  matrix_row_counts[i02] += 1;
              }
          }
@@ -1684,7 +1692,7 @@ index 33193a5..0d567a2 100644
  
      // reset current_chunk
      for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-@@ -1714,19 +2633,31 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1714,19 +2641,31 @@ static void ggml_compute_forward_mul_mat_id(
  
      ggml_barrier(params->threadpool);
  
@@ -1719,7 +1727,7 @@ index 33193a5..0d567a2 100644
          const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
-@@ -1749,7 +2680,10 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1749,7 +2688,10 @@ static void ggml_compute_forward_mul_mat_id(
              nchunk1 = nr0 > nr1 ? 1 : nth;
          }
  
@@ -1731,7 +1739,7 @@ index 33193a5..0d567a2 100644
          const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
  
          int current_chunk = ith;
-@@ -1766,11 +2700,30 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1766,11 +2708,30 @@ static void ggml_compute_forward_mul_mat_id(
              const int64_t ir1_start = dr1 * ith1;
              const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
  
@@ -1767,7 +1775,7 @@ index 33193a5..0d567a2 100644
  
              if (nth >= nchunk0 * nchunk1) {
                  break;
-@@ -3137,6 +4090,47 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3137,6 +4098,47 @@ static int ggml_cpu_try_fuse_ops(
      return 0;
  }
  
@@ -1815,7 +1823,7 @@ index 33193a5..0d567a2 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3149,6 +4143,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3149,6 +4151,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  #else
      set_numa_thread_affinity(state->ith);
  #endif
@@ -1826,7 +1834,7 @@ index 33193a5..0d567a2 100644
  
      struct ggml_compute_params params = {
          /*.ith        =*/ state->ith,
-@@ -3179,12 +4177,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3179,12 +4185,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  
          // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
          // Try fused ops, fall back to normal compute
@@ -1857,7 +1865,7 @@ index 33193a5..0d567a2 100644
  
          if (state->ith == 0 && cplan->abort_callback &&
                  cplan->abort_callback(cplan->abort_callback_data)) {
-@@ -3195,6 +4207,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3195,6 +4215,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          if (node_n + 1 < cgraph->n_nodes) {
              ggml_barrier(state->threadpool);
          }
@@ -1885,7 +1893,7 @@ index 2978340..ace25a9 100644
 +    int                 own_pool_n;
  };
  
-+// GGML_CPU_PERSIST_POOL=1 (sage-lab, runs/speed/THREAD_SCALING.md): with no threadpool attached, keep one pool alive
++// GGML_CPU_PERSIST_POOL=1 (inkling-ios, runs/speed/THREAD_SCALING.md): with no threadpool attached, keep one pool alive
 +// across graphs instead of creating and joining a disposable pool (new threads) for every graph. GGML_CPU_POLL=<0..100>
 +// sets its polling level (ggml default 50). Off by default.
 +static bool ggml_backend_cpu_persist_pool(void) {
@@ -1956,14 +1964,19 @@ index 2978340..ace25a9 100644
      return NULL;
  
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index cd81347..d534a0a 100644
+index cd81347..4ee0071 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -8747,6 +8747,11 @@ static void ggml_compute_forward_argsort_f32(
+@@ -8747,6 +8747,16 @@ static void ggml_compute_forward_argsort_f32(
  
      ggml_sort_order order = (ggml_sort_order) ggml_get_op_params_i32(dst, 0);
  
-+    const float cecar_bonus = (order == GGML_SORT_ORDER_DESC && nr == 1 && ne0 <= 512) ? ggml_cpu_mmid_cecar_bonus() : 0.0f;
++    static int cecar_prefill = -1;
++    if (cecar_prefill < 0) {
++        const char * ep = getenv("GGML_MMID_CECAR_PREFILL");
++        cecar_prefill = (ep && atoi(ep) == 1) ? 1 : 0;
++    }
++    const float cecar_bonus = (order == GGML_SORT_ORDER_DESC && (nr == 1 || cecar_prefill) && ne0 <= 512) ? ggml_cpu_mmid_cecar_bonus() : 0.0f;
 +    const char * cecar_base = nullptr;
 +    size_t cecar_nb2 = 0;
 +    const bool use_cecar = cecar_bonus > 0.0f && ggml_mmid_get_router(dst, &cecar_base, &cecar_nb2);
@@ -1971,34 +1984,25 @@ index cd81347..d534a0a 100644
      for (int64_t i = ith; i < nr; i += nth) {
          const float * src_data = (float *)((char *) src0->data + i*nb01);
  
-@@ -8756,6 +8761,26 @@ static void ggml_compute_forward_argsort_f32(
+@@ -8756,6 +8766,17 @@ static void ggml_compute_forward_argsort_f32(
              dst_data[j] = j;
          }
  
 +        if (use_cecar) {
 +            float adj[512];
-+            int32_t orig[512];
 +            for (int64_t j = 0; j < ne0; j++) {
-+                orig[j] = (int32_t) j;
 +                adj[j] = src_data[j] + (ggml_cpu_mmid_is_cached(cecar_base, cecar_nb2, (int) j) ? cecar_bonus : 0.0f);
 +            }
-+            std::sort(dst_data, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_DESC>{adj});
-+            std::partial_sort(orig, orig + (ne0 < 4 ? ne0 : 4), orig + ne0, cmp_argsort<GGML_SORT_ORDER_DESC>{src_data});
-+            int swaps = 0;
-+            int kchk = ne0 < 4 ? (int) ne0 : 4;
-+            for (int a = 0; a < kchk; a++) {
-+                bool found = false;
-+                for (int b = 0; b < kchk; b++) { if (dst_data[a] == orig[b]) { found = true; break; } }
-+                if (!found) { swaps++; }
-+            }
-+            ggml_cpu_mmid_cecar_note(swaps);
++            const int64_t topn = ne0 < 8 ? ne0 : 8;
++            std::partial_sort(dst_data, dst_data + topn, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_DESC>{adj});
++            ggml_cpu_mmid_cecar_note(0);
 +            continue;
 +        }
 +
          switch (order) {
              case GGML_SORT_ORDER_ASC:
                  std::sort(dst_data, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_ASC>{src_data});
-@@ -9511,6 +9536,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9511,6 +9532,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t partial_stride = nth * partial_size;
          float *       chunk_partials = partials_base + ith * partial_size;
  
@@ -2006,7 +2010,7 @@ index cd81347..d534a0a 100644
          if (ic_start < nek1) {
              for (int64_t q_head = 0; q_head < neq2; q_head++) {
                  ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-@@ -9525,6 +9551,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9525,6 +9547,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
              }
          }
  
@@ -2014,7 +2018,7 @@ index cd81347..d534a0a 100644
          ggml_barrier(params->threadpool);
          ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
      } else {
-@@ -9572,11 +9599,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9572,11 +9595,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
              const int64_t ir0 = dr * current_chunk;
              const int64_t ir1 = MIN(ir0 + dr, nr);
  
@@ -2488,7 +2492,7 @@ index b47c5ad..5f5dfeb 100644
  }
 +
 +
-+// File-mapping registry (sage-lab, inkling-phone): lets a backend turn a pointer into a memory-mapped model file
++// File-mapping registry (inkling-ios, inkling-phone): lets a backend turn a pointer into a memory-mapped model file
 +// back into (fd, offset), to read ranges with pread instead of page faults. Registered by llama_mmap.
 +#if defined(__APPLE__) || defined(__linux__)
 +#include <errno.h>

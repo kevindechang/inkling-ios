@@ -39,7 +39,7 @@ static bool on_progress(float p, void *) {
 }
 
 int inkling_gen(int argc, char ** argv) {
-    std::string lora, state_save, state_load, warm_prompt, ctk = "f16", ctv = "f16";   // -lora <file>: GGUF LoRA adapter applied at scale 1
+    std::string lora, state_save, state_load, warm_prompt, vbench_file, vbench_sizes, ctk = "f16", ctv = "f16";   // -lora <file>: GGUF LoRA adapter applied at scale 1
     std::string model, prompt = "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>Give me three short tips for sleeping better.<|end_message|><|message_model|>";
     int ngl = 99, n_gen = 32, n_ctx = 2048, n_ub = 64, threads = 4, threads_batch = 0; bool use_mmap = true; std::string cpu_pat; int passes = 0, n_used = 0; llama_lazy_mode lazy = LLAMA_LAZY_MODE_AUTO;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -48,6 +48,8 @@ int inkling_gen(int argc, char ** argv) {
         else if (a == "-c") n_ctx = std::stoi(v); else if (a == "-ub") n_ub = std::stoi(v); else if (a == "-t") threads = std::stoi(v);
         else if (a == "-tb") threads_batch = std::stoi(v);
         else if (a == "-ctk") ctk = v; else if (a == "-ctv") ctv = v;
+        else if (a == "-vf") { std::ifstream f(v); std::stringstream ss; ss << f.rdbuf(); vbench_file = ss.str(); }
+        else if (a == "-vbench") vbench_sizes = v;
         else if (a == "-lm") use_mmap = v != "none"; else if (a == "-cpu") cpu_pat = v; else if (a == "-passes") passes = std::stoi(v); else if (a == "-k") n_used = std::stoi(v); else if (a == "-p") prompt = v;
         else if (a == "-lzm") lazy = v == "on" ? LLAMA_LAZY_MODE_ON : v == "off" ? LLAMA_LAZY_MODE_OFF : LLAMA_LAZY_MODE_AUTO;
         else if (a == "-f") { std::ifstream f(v); std::stringstream ss; ss << f.rdbuf(); prompt = ss.str(); }
@@ -178,6 +180,48 @@ int inkling_gen(int argc, char ** argv) {
         fprintf(stderr, "[warm_ttft] prompt_tokens=%zu new_tokens=%zu ttft_s=%.3f (%.1f tok/s) tb=%d reused=%zu\n",
                 wtoks.size(), wtoks.size() - wstart, wt_s, (wtoks.size() - wstart) / std::max(wt_s, 1e-6), threads_batch, wreused);
         ggml_cpu_mmid_stats_dump();
+    }
+    if (!vbench_sizes.empty() && !vbench_file.empty()) {
+        std::vector<llama_token> vtoks(vbench_file.size() + 16);
+        vtoks.resize(llama_tokenize(vocab, vbench_file.c_str(), (int) vbench_file.size(), vtoks.data(), (int) vtoks.size(), false, true));
+        std::stringstream ss(vbench_sizes);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            int B = std::stoi(item);
+            if (B <= 0) continue;
+            llama_memory_clear(llama_get_memory(ctx), true);
+            // Prefill short prefix so KV is non-empty
+            if (vtoks.size() < (size_t) (32 + 20 * B)) continue;
+            if (llama_decode(ctx, llama_batch_get_one(vtoks.data(), 32)) != 0) break;
+            ggml_cpu_mmid_stats_reset();
+            std::vector<double> vms, vcpu;
+            uint64_t ch0, cm0, cmb0, cb0; ggml_cpu_mmid_cache_stats(&ch0, &cm0, &cmb0, &cb0);
+            int n_steps = std::min<int>(20, ((int) vtoks.size() - 32) / B);
+            for (int s_idx = 0; s_idx < n_steps; s_idx++) {
+                double pi0, c0, pi1, c1; usage_now(pi0, c0);
+                double t0 = now_s();
+                if (llama_decode(ctx, llama_batch_get_one(vtoks.data() + 32 + s_idx * B, B)) != 0) { fprintf(stderr, "[vbench] decode failed B=%d\n", B); break; }
+                vms.push_back((now_s() - t0) * 1000.0);
+                usage_now(pi1, c1);
+                vcpu.push_back((c1 - c0) * 1000.0);
+            }
+            uint64_t ch1, cm1, cmb1, cb1; ggml_cpu_mmid_cache_stats(&ch1, &cm1, &cmb1, &cb1);
+            if (!vms.empty()) {
+                auto vs = vms; std::sort(vs.begin(), vs.end());
+                double sum_ms = 0, sum_cpu = 0;
+                for (double x : vms) sum_ms += x;
+                for (double x : vcpu) sum_cpu += x;
+                double mean_ms = sum_ms / vms.size();
+                double med_ms = vs[vs.size() / 2];
+                double mean_cpu = sum_cpu / vcpu.size();
+                double miss_step = (double) (cm1 - cm0) / vms.size();
+                double miss_mb_step = (double) (cmb1 - cmb0) / 1048576.0 / vms.size();
+                fprintf(stderr, "[vbench] B=%d steps=%zu tb=%d med=%.1fms mean=%.1fms cpu=%.1fms miss=%.1f/step (%.1fMB) foot=%.0fMB | eff@3.5=%.1f eff@4.0=%.1f tok/s\n",
+                        B, vms.size(), threads_batch, med_ms, mean_ms, mean_cpu, miss_step, miss_mb_step, footprint_mb(),
+                        3500.0 / (mean_ms + 18.0), 4000.0 / (mean_ms + 18.0));
+                ggml_cpu_mmid_stats_dump();
+            }
+        }
     }
     std::vector<double> s = ms; std::sort(s.begin(), s.end());
     double sum = 0; for (double x : ms) sum += x;

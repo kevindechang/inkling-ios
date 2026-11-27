@@ -7,7 +7,7 @@ Paths:
 - `TF` = `train/.pydeps/transformers/` (transformers 5.24.0, the first PyPI release that has `inkling2_loop`;
   released 2026-11-21). Its `models/inkling2_loop/modeling_inkling2_loop.py` is byte-identical to the copy in the
   scratchpad (`diff` returned no difference).
-- `LC` = `sage-lab/lab/inkling-phone/llama.cpp/` (HEAD 8a97fa9 plus local uncommitted patches).
+- `LC` = `inkling-ios/lab/inkling-phone/llama.cpp/` (HEAD 8a97fa9 plus local uncommitted patches).
 - `M` = `TF/models/inkling2_loop/modeling_inkling2_loop.py`.
 
 Model pin: the requested revision `ed40e7da625f594fc9c4990f5f66be24873c22d7` exists on the Hub (lastModified
