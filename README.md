@@ -1,12 +1,12 @@
 # `inkling-ios` — `Inkling-2-FlashPin-26B`
 
-**Running a 26.4B-parameter, 128-expert Mixture-of-Experts model on an iPhone 15 Pro CPU at `21–23.4 tok/s` sustained (`18.4 tok/s` under 3-topic domain switching) — with all `128/128` experts intact, `8K` `Q8_0` context, exact `200K` vocabulary, `< 4.4 GB` peak RAM, and `nominal → nominal` thermals.**
+**Running a 26.4B-parameter, 128-expert Mixture-of-Experts model on an iPhone 15 Pro CPU at `21–23.4 tok/s` over 200-token runs on the v1 GGUF (`18.4 tok/s` under 3-topic domain switching; the v2 GGUF measured a median `22.46 tok/s` with the `v35d` env, see [`v36`](#v2-on-iphone-15-pro-v36-prepack0)) — with all `128/128` experts intact, an `8K` `Q8_0` KV context allocated, exact `200K` vocabulary, `< 4.4 GB` peak RAM, and `nominal → nominal` thermals.**
 
 - **Published GGUF Weights (Apache 2.0):** [`kevinexus/Inkling-2-FlashPin-26B-GGUF`](https://huggingface.co/kevinexus/Inkling-2-FlashPin-26B-GGUF)
   - File: `inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, `9.39 GiB`, all `128/128` experts retained)
   - SHA-256: `6d856056c0ff323711a487233dc5c63425f1896547803c38aac6c5f39d2acf09`
-  - **v2 (quality update, same layout):** `inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, all `128/128` experts retained), SHA-256 `9b6b87fdb8fa01deb3b69ffbee6e59b98ecea65b1f3305d5fbb9db3d3bebc351`. See [v2 below](#v2-quality-update-mac-measured-iphone-pending) and [`docs/V2.md`](docs/V2.md).
-- **Raw Verification Artifacts:** [`eval/results/iphone15pro_v35/`](eval/results/iphone15pro_v35/) (every `[tok]`, RAM footprint, `[mmid]`, `[warm_ttft]`, generated text, and thermal reading) + [`eval/results/quality_80item/`](eval/results/quality_80item/) (raw deterministic JSON summaries **and all 640 per-example `*_replies.jsonl` model predictions across v1 and v2**) + [`eval/results/mac_v1_vs_v2/`](eval/results/mac_v1_vs_v2/) + [`eval/results/v2_training/`](eval/results/v2_training/) + exact prompt files in [`eval/results/iphone15pro_v35/prompts/`](eval/results/iphone15pro_v35/prompts/).
+  - **v2 (quality update, same layout):** `inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, all `128/128` experts retained), SHA-256 `9b6b87fdb8fa01deb3b69ffbee6e59b98ecea65b1f3305d5fbb9db3d3bebc351`. See [v2 below](#v2-quality-update-iphone-speed-measured-236-item-run-pending) and [`docs/V2.md`](docs/V2.md).
+- **Raw Verification Artifacts:** [`eval/results/iphone15pro_v35/`](eval/results/iphone15pro_v35/) (every `[tok]`, RAM footprint, `[mmid]`, `[warm_ttft]`, generated text, and thermal reading) + [`eval/results/iphone15pro_v36_v2/`](eval/results/iphone15pro_v36_v2/) (v2 GGUF on-phone logs) + [`eval/results/quality_80item/`](eval/results/quality_80item/) (raw deterministic JSON summaries **and all 640 per-example `*_replies.jsonl` model predictions across v1 and v2**) + [`eval/results/mac_v1_vs_v2/`](eval/results/mac_v1_vs_v2/) + [`eval/results/v2_training/`](eval/results/v2_training/) + exact prompt files in [`eval/results/iphone15pro_v35/prompts/`](eval/results/iphone15pro_v35/prompts/).
 
 > **Explicit Scope & Lineage (Read Before Judging):**
 > 1. **Base Model & Shape:** Derived from Apache-2.0 [`thinkingmachines/TML-d24-varloop-research`](https://huggingface.co/thinkingmachines/TML-d24-varloop-research) (the 26.4B variable-loop research sibling of Inkling 2, `inkling2_loop`, 24 blocks, 128 experts/layer) — **not** the fixed 3-pass Inkling 2 Mini checkpoint. Distilled and run at **1 loop pass, top-4 experts (`-passes 1 -k 4`)** with **zero experts pruned (`128/128` intact)**.
@@ -18,7 +18,7 @@
 
 ---
 
-## v2 Quality Update (Mac-measured, iPhone pending)
+## v2 Quality Update (iPhone speed measured, 236-item run pending)
 
 v2 retrains v1 with quantization-aware working-set distillation (`qat40pareto`, 220 steps, `$12.51`). The layout, size, Hot-40 order and runtime are identical to v1, and all `128/128` experts are intact. Full details, training curves and limitations are in [`docs/V2.md`](docs/V2.md).
 
@@ -33,6 +33,32 @@ Quality uses the same 80 item IDs and scorers as v1, effort `0.45`, uncapped thi
 - **Small samples:** each of MATH-500, Logic and GPQA has only 10 items. The full 236-item run on v2 is still pending.
 - **Runtime speed (Mac, identical settings):** With OPT λ=0.95, v2 reads 11.3 / 11.9 expert slices per token on `p_math` / `v34_mix`, vs 10.8 / 13.1 for v1 ([logs](eval/results/mac_v1_vs_v2/)). v2 therefore needs the same cache-aware routing as v1. Its trained router bias did **not** reduce runtime misses on its own.
 - **Training finding:** Pushing the router below about 30% cold traffic raised tool/instruction KL about 3× (`0.17 → 0.49`). A bounded bias (62% → 37% cold) improved every distillation metric ([`docs/V2.md` §2](docs/V2.md#2-finding-the-working-set-pareto-cliff)).
+
+### v2 on iPhone 15 Pro (`v36`, `prepack=0`)
+
+The v2 GGUF was copied to an iPhone 15 Pro over USB and run with the already-installed `InklingBench` build (no rebuild), CPU-only, `-ngl 0 -t 2 -tb 4 -ub 64 -passes 1 -k 4 -c 8192 -ctk q8_0 -ctv q8_0`, exact `200K` head. Raw logs and the exact commands are in [`eval/results/iphone15pro_v36_v2/`](eval/results/iphone15pro_v36_v2/).
+
+**Headline: median of the three run-means for `v35d` on `p_math` is `22.46 tok/s`** (range `20.79–22.83`, 3 runs, 200 generated tokens, phone unplugged, thermal `nominal → nominal` on every run, peak RAM `4,315 MB`). This is the 1-pass top-4 distill on a CPU, not the 3-pass Inkling 2 Mini.
+
+| Run (raw log) | Prompt / gen | Env | Cable | Thermal start → end | `[gen]` decode (med / mean ms) | Decode `tok/s` | Cold prefill (`prefill_s`) | `warm_ttft` (40t) | Peak / steady RAM | `[mmid]` hits / misses (whole run) |
+|---|---|---|---|---|---|---:|---|---|---|---|
+| [`v36a`](eval/results/iphone15pro_v36_v2/v36a_v2_v35a_wired_fair.log) | `p_math` 66t / 200 | `v35a` (2700 / 36 / OPT λ=0.95) | wired | fair → fair | 51 / 53 | `18.76` | 4.69 s | 0.858 s | 4,062 / 3,950 MB | 40,801 / 5,494 |
+| [`v36b`](eval/results/iphone15pro_v36_v2/v36b_v2_v35a_unplugged.log) | `p_math` 66t / 200 | `v35a` | unplugged | nominal → nominal | 48 / 57 | `17.43` | 5.28 s | 0.921 s | 4,061 / 3,933 MB | 40,911 / 5,351 |
+| [`v36c`](eval/results/iphone15pro_v36_v2/v36c_v2_v35a_unplugged_repeat.log) | `p_math` 66t / 200 | `v35a` | unplugged | nominal → nominal | 49 / 53 | `18.77` | 4.65 s | 0.891 s | 4,061 / 3,937 MB | 40,911 / 5,351 |
+| [`v36d1`](eval/results/iphone15pro_v36_v2/v36d1_v2_v35d_p_math.log) | `p_math` 66t / 200 | `v35d` (2950 / 40 / CECAR 0.35) | unplugged | nominal → nominal | 41 / 44 | **`22.83`** | 4.32 s | 0.693 s | 4,315 / 4,195 MB | 41,299 / 4,155 |
+| [`v36d2`](eval/results/iphone15pro_v36_v2/v36d2_v2_v35d_p_math.log) | `p_math` 66t / 200 | `v35d` | unplugged | nominal → nominal | 42 / 45 | **`22.46`** | 4.37 s | 0.740 s | 4,315 / 4,195 MB | 41,299 / 4,155 |
+| [`v36d3`](eval/results/iphone15pro_v36_v2/v36d3_v2_v35d_p_math.log) | `p_math` 66t / 200 | `v35d` | unplugged | nominal → nominal | 44 / 48 | **`20.79`** | 4.50 s | 0.788 s | 4,315 / 4,187 MB | 41,299 / 4,155 |
+| [`v36m1`](eval/results/iphone15pro_v36_v2/v36m1_v2_v35d_mix.log) | `v34_mix` 127t / 200 | `v35d` | unplugged | nominal → nominal | 41 / 43 | `23.03` | 5.41 s | 0.655 s | 4,320 / 4,187 MB | 42,666 / 4,545 |
+| [`v36m2`](eval/results/iphone15pro_v36_v2/v36m2_v2_v35d_mix.log) | `v34_mix` 127t / 200 | `v35d` | unplugged | nominal → nominal | 43 / 48 | `20.64` | 6.15 s | 0.752 s | 4,319 / 4,217 MB | 42,666 / 4,545 |
+| [`v36m3`](eval/results/iphone15pro_v36_v2/v36m3_v2_v35d_mix.log) | `v34_mix` 127t / 200 | `v35d` | unplugged | nominal → nominal | 44 / 48 | `20.86` | 6.05 s | 0.689 s | 4,318 / 4,187 MB | 42,666 / 4,545 |
+| [`v36L`](eval/results/iphone15pro_v36_v2/v36L_v2_v35d_p_math_n1000_eos285.log) | `p_math` 66t / `-n 1000` (stopped at EOG after 285 tokens) | `v35d` | unplugged | nominal → nominal | 50 / 52 | `19.26` | 4.38 s | 0.790 s | 4,315 / 4,194 MB | 57,559 / 4,734 |
+
+- **Mix prompt (`v34_mix`, 3 topics, `v35d`):** median of run-means `20.86 tok/s` (range `20.64–23.03`, 3 runs, 200 tokens). Run-to-run spread is larger than on `p_math`.
+- **`-n 1000` on `p_math`:** the answer ended at EOG after `285` tokens, so this is **not** a 1,000-token measurement. Mean `19.26 tok/s` over those 285 tokens (`50 / 52 ms`).
+- **`v35a` on v2 is slower than on v1:** `17.43–18.77 tok/s` (median of the three `v35a` runs `18.76`) versus `23.43` for v1 on the same config. `v35d` is the config to use with v2. GGUF headers of the v2 and v1 (`varloop-stage2-v1-run3-reap40-i8mm.gguf`) files show the same 704 tensors with identical types and shapes, so the difference is not layout. In the logs, v2 `v35a` has similar flash wait (`wait_ms` `170.0–232.1` vs `424.7` for v1 `v35a`) but higher per-token CPU time (`cpu_ms` mean `85–89` vs `67`).
+- **TTFT, stated plainly:** `warm_ttft` is a 40-token Turn-2 prefill plus first logit after the cache and state are already warm: `0.655–0.790 s` on the `v35d` runs. A cold prompt is much slower: the 66-token `p_math` prefill took `4.32–4.50 s` and the 127-token mix prefill took `5.41–6.15 s` on `v35d` runs. The model load itself is not counted in either.
+- **Speed at long context is not measured.** `-c 8192` is allocated, but all of these runs use prompts of 66–127 tokens and 200–285 generated tokens.
+- **Not run on v2:** `prepack=1` (needs a separately repacked file) and any rebuild. One phone, one unit, one day; `v36b`/`v36c` and `v36d*` were run back to back, `v36a` on the cable.
 
 ---
 
@@ -89,9 +115,9 @@ All benchmarks use deterministic public code-scored datasets ([`eval/suite_spec.
 
 | Goal | Target | Verified Result (`Inkling-2-FlashPin-26B`, `128/128` Experts) | Status |
 |---|---|---|---|
-| **Sustained decode** | **`>= 20 tok/s`** (`<= 50 ms/tok` mean) | **`23.43 tok/s`** (`v35a`, 200t, `prepack=0`, exact head); **`21.78 tok/s`** (`v35d`, `CECAR=0.35`, `prepack=0`); **`21.20 tok/s`** (`v35f`, 375t EOG, `prepack=1`); **`18.36 tok/s`** (`v35f_mix`, 400t 3-topic switch, `prepack=1`) | **Met on single-topic (`21.2–23.4 t/s`); `18.4 t/s` on 3-topic mix** |
+| **Decode speed (200–400-token runs)** | **`>= 20 tok/s`** (`<= 50 ms/tok` mean) | **`23.43 tok/s`** (`v35a`, 200t, `prepack=0`, exact head); **`21.78 tok/s`** (`v35d`, `CECAR=0.35`, `prepack=0`); **`21.20 tok/s`** (`v35f`, 375t EOG, `prepack=1`); **`18.36 tok/s`** (`v35f_mix`, 400t 3-topic switch, `prepack=1`); **v2 GGUF:** median `22.46 tok/s` (`v35d`, `p_math`, 3 runs), `20.86 tok/s` on the mix prompt (3 runs), `17.4–18.8 tok/s` with `v35a` | **Met on single-topic (`21.2–23.4 t/s`); `18.4 t/s` on 3-topic mix** |
 | **Warm Prefill / 1st-Logit** | **`<= 2.0 s`** | **`0.761 s`** (`52.6 tok/s`, `v35d`, 40t Turn-2 prefill + final logit) / **`0.978 s`** (`40.9 tok/s`, `v35a`) *(excludes ~0.1 ms detokenize & cold load)* | **Met (`< 1.0 s` warm prefill/1st-logit)** |
-| **Context window** | **`8K`** at `>= 20 tok/s` | **`8K` (`Q8_0` KV)** verified on every `v35` row (`3,922–4,364 MB` peak); **`16K`** also proven (`v29`) | **Met (`8K Q8_0` on every `v35` run)** |
+| **Context window** | **`8K`** context fits in memory while decoding at `>= 20 tok/s` | **`8K` (`Q8_0` KV)** allocated and run within memory on every `v35` row (`3,922–4,364 MB` peak); prompts were `66–127` tokens, so speed at a full `8K` context is **not measured**; `16K` fit was also shown (`v29`) | **Fits in memory (`8K Q8_0` allocated on every `v35`/`v36` run); speed at full context not measured** |
 | **Memory & Thermal** | **`<= 4.5 GB`** (`nominal`) | **`3,945–4,225 MB`** steady (`4,062–4,364 MB` peak, `-ub 64`), **`nominal → nominal`** on all 9 `v35` runs (iOS compressor cliff mapped at `~4,450 MB`) | **Met with `~100–400 MB` margin** |
 | **Quality** | Reasoning / tool-use / writing intact | `GSM8K 73–80%`, `BFCL 60–80%`, `IFEval 47–67%`, `MATH-500 30–40%`, `Logic 10–20%`, `GPQA 0–30%` (`N=80`; raw predictions published) | **Strong on GSM8K/BFCL/IFEval; Logic/GPQA/MATH-500 remain the main gap** |
 | **Concise thinking** | `~150–350` tok | `245–296` tok (`soft_cap=320`) / `351–381` tok (`cap=384`) vs `600–1,100` tok baseline | **Met (`-55–65%` think tokens)** |
@@ -186,7 +212,7 @@ To eliminate runtime CPU repacking on miss-heavy / multi-topic workloads (`repac
 - [`quant/`](quant/) — KL sweeper (`kl_sweep.py`), DP allocator (`dp_allocate.py`), `i8mm` tensor upgrader (`repack_i8mm_gguf.py`), streaming BF16 mergers (`merge_run3_local.py`, `merge_wsd_local.py`), REAP tracer/pruner (`reap_trace.cpp`, `prune_gguf.py`), and quant recipes
 - [`train/`](train/) — Stage 2 (`distill.py`), Stage 3 hard-pruned (`distill_pruned.py`), Working-Set Concentration (`distill_workingset.py`), local Mac router (`train_mac_routers.py`), and EAGLE-v3 (`train_mac_eagle_v3.py`, `export_eagle_bin.py`) scripts + architecture notes (`FACTS.md`)
 - [`tools/`](tools/) — Reversible offline pre-repacker (`prerepack_exps.cpp`), per-layer CECAR optimizer (`optimize_cecar_layers.py`), EAGLE drafter (`eagle_draft.hpp`, `gen_mac_eagle.cpp`), router dump (`dump_fmrd_data.cpp`)
-- [`eval/`](eval/) — Public 271-item suite specification (`suite_spec.json`), full scoreboards (`results/summary.md`), raw sanitized iPhone 15 Pro `v35` telemetry logs + prompt files (`results/iphone15pro_v35/`), and raw 80-item quality JSONs (`results/quality_80item/`)
+- [`eval/`](eval/) — Public suite specification (`suite_spec.json`, `inkling-ios-dev-271`: `120` reasoning + `76` tool-use + `75` writing/instruction items; the published `N=236` v1 baseline is `120` + `76` + `40` `IFEval` and omits the `35` `IFBench` items, per [`results/summary.md`](eval/results/summary.md)), full scoreboards (`results/summary.md`), raw sanitized iPhone 15 Pro `v35` telemetry logs + prompt files (`results/iphone15pro_v35/`), and raw 80-item quality JSONs (`results/quality_80item/`)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — System architecture & roofline analysis
 - [`docs/LOG.md`](docs/LOG.md) — Complete chronological engineering log (every experiment, number, cost, and dead end)
 - [`docs/V2.md`](docs/V2.md) — v2 QAT working-set distillation: recipe, Pareto-cliff training curves, N=80 quality, Mac cache behaviour, open issues

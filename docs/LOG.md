@@ -15,7 +15,7 @@ Complete, transparent chronological record of every experiment, measured number,
 | **P37** (Nov 24) | Sibling `Q2_K_XL`, 1p K4, `-t 2`, `OVERLAP=1` | `~66 ms` | `13.0–13.2 tok/s` (`72–73 ms`) | `4.68 GB` | fair | Atomic known-route paired-`down` overlap (`-40%` ms, `-33%` CPU) |
 | **v21** (Nov 26) | + `IOS_I8MM=1` (`armv8.6+i8mm`), `-t 2` | **`69.0 ms`** (`cpu 138`) | **`13.3 tok/s`** (`73.0 / 75.2 ms`) | `4.66 GB` | fair | Reproducible `-6.0 ms/tok` zero-miss win on A17 Pro |
 | **v26** (Nov 27) | `varloop-stage2-v1` (128e) + `REPACK=1` + NEON `Q2_K`, `-t 2`, `3250 MB` | **`43–44 ms`** (`22.7–23.3 t/s`, `cpu 86`) | `10.1–13.7 tok/s` (`73–99 ms`, `11–19 miss/t`) | `4.69 GB` | nominal | KL+DP quant (`23× Q2_K`) + `2.23×` faster NEON repack; flash wait still `+25–45 ms` |
-| **v28** (Nov 27) | **`varloop-stage2-e48`** (48e, `4.08 GiB`), `REPACK=1`, `-t 2 -tb 4`, `3300 MB` | **`48.0 ms`** (`cpu 95`) | **`21.06 tok/s`** (`47.5 ms` tok `20–449`; **`20.23 t/s`** last 250 tok) | **`4.36 GB`** | fair | **True sustained `>= 20 tok/s` proven on iPhone 15 Pro** (`miss 0.3–0.7/t`, cold 70t prefill `3.0 s`) |
+| **v28** (Nov 27) | **`varloop-stage2-e48`** (48e, `4.08 GiB`), `REPACK=1`, `-t 2 -tb 4`, `3300 MB` | **`48.0 ms`** (`cpu 95`) | **`20.17 tok/s`** over all 450 tok (`50 ms`); `21.06 tok/s` for tok `20–449` (`47.5 ms`); `20.23 t/s` last 250 tok | **`4.36 GB`** | fair | **`>= 20 tok/s` for a hard-pruned `e48` model (untrained `e48` scored `0/30` GSM8K, see the pruning curve below), USB-C plugged in, thermal `fair`; the raw `v28` log is not in this repo** (`miss 0.3–0.7/t`, cold 70t prefill `3.0 s`) |
 
 ---
 
@@ -98,7 +98,7 @@ Complete, transparent chronological record of every experiment, measured number,
   - **`Logic` (`30/30`):** `20.0%` (`6/30`, avg think `1,099`, matches `LFM3` `20.0%`); **`GPQA Diamond` (`30/30`):** `16.7%` (`5/30`, avg think `1,041`).
   - **`BFCL Tool Use` (`76/76` ALL):** **`85.5%`** (`65/76`, avg think `129`) — matches `Qwen 3.6 35B` (`86.8%`).
   - **`IFEval` (`40/40`):** `52.5%` (`21/40`, avg think `1,023`, hurt by old LoRA loops).
-- **REAP Expert Pruning + True Sustained `21.06 tok/s` on iPhone 15 Pro (`v28`):**
+- **REAP Expert Pruning + `20.17 tok/s` over 450 tokens (`21.06 tok/s` excluding the first 20) on iPhone 15 Pro (`v28`, plugged in, pruned model, speed-only datapoint):**
   - Built `quant/reap_trace.cpp` (exact `cb_eval` REAP salience `sum_t |w_e| * ||down_e(x_t)||_2`) and `quant/prune_gguf.py` (raw quantized byte slicing, zero re-quantization).
   - Traced `80,044` tokens (`188` docs at `150.5 tok/s`) on a leak-free Reasoning + Writing + Tool-Use corpus (`0%` coding, `0%` eval overlap).
   - **Key structural discovery:** Because Thinking Machines already pruned `384 → 128` load-balanced experts, activation frequencies across all 128 experts are dead-flat (`2,500 ± 40` per expert in every layer). There are no dead or coding-only experts to drop for free.
@@ -172,4 +172,15 @@ Full write-up: [`docs/V2.md`](V2.md).
   - `exp_probs_b` hot−cold gap: `0.18–0.25` per layer (v1: `0.00–0.07`).
 - **N=80, same items as v1, effort 0.45.** v2 with `CECAR=0`: GSM8K-Hard 12/15, MATH-500 4/10, Logic 5/10, GPQA 2/10 (Reas 23/45 = 51.1%), BFCL 13/20, IFEval 8/15, Mean 56.5%. v1 with OPT λ=0.95: Reas 18/45 = 40.0%, BFCL 15/20, IFEval 7/15, Mean 53.9%. The v2 OPT λ=0.95 row is in `docs/V2.md` §3.
 - **Negative / open result.** On the Mac at `2700/36`, v2 at `CECAR=0` does **not** have fewer cache misses than v1 (`p_math` 38.4 vs 30.4 miss/tok; `v34_mix` 47.9 vs 48.4). The training-time cold reduction does not reach the runtime. With OPT λ=0.95 the two are on par (11.3 vs 10.8 and 11.9 vs 13.1 miss/tok).
-- **iPhone.** Two Wi-Fi `devicectl` copies of the v2 GGUF failed (`ECONNRESET`). **There is no v2 iPhone measurement yet**, and the README makes no v2 iPhone speed claim.
+- **iPhone.** Two Wi-Fi `devicectl` copies of the v2 GGUF failed (`ECONNRESET`). The file was later copied over USB and measured, see the `v36` entry below.
+
+## 2026-11-28 (evening) — v2 on iPhone 15 Pro (`v36`)
+
+Raw logs: [`eval/results/iphone15pro_v36_v2/`](../eval/results/iphone15pro_v36_v2/). v2 GGUF copied over USB (`10,080,548,288` bytes on the phone), already-installed `InklingBench` build, no rebuild, CPU-only, `-ngl 0 -t 2 -tb 4 -ub 64 -passes 1 -k 4 -lm none -lzm on -c 8192 -ctk q8_0 -ctv q8_0 -n 200`, `prepack=0`, exact `200K` head. Runs after `v36a` were unplugged with `phone.sh thermal` reading `nominal` before each launch.
+
+- **`v35a` env on v2 (`2700 / 36 / OPT λ=0.95`):** `18.76` (wired, thermal `fair`), `17.43` and `18.77 tok/s` (unplugged, `nominal`). v1 on the same env was `23.43`. Cooling and unplugging did not change the result. v2 and v1 GGUF headers have identical tensor names, types and shapes. v2 `v35a` has `cpu_ms` mean `85.4–88.9` against `67.1` for v1 `v35a`, and `wait_ms` `170.0–232.1` against `424.7`.
+- **`v35d` env on v2 (`2950 / 40 / CECAR=0.35`), `p_math`, 200 tokens:** `22.83`, `22.46`, `20.79 tok/s`. Median of the run-means: **`22.46 tok/s`**. Warm TTFT `0.693 / 0.740 / 0.788 s`, peak RAM `4,315 MB`, `[mmid]` `41,299` hits / `4,155` misses in every run, thermal `nominal → nominal`.
+- **`v35d` on the mix prompt (`v34_mix`, 127 tokens, 200 generated):** `23.03`, `20.64`, `20.86 tok/s`. Median of run-means `20.86`. Warm TTFT `0.655 / 0.752 / 0.689 s`, peak `4,318–4,320 MB`, `42,666` hits / `4,545` misses.
+- **`-n 1000` on `p_math`:** ended at EOG after `285` tokens (`19.26 tok/s`, `50 / 52 ms`, peak `4,315 MB`). Not a 1,000-token measurement.
+- **Cold vs warm TTFT:** warm (`40`-token Turn-2 prefill after the cache is warm) `0.655–0.790 s` on the `v35d` runs; cold prompt prefill `4.32–4.50 s` (`66` tokens) and `5.41–6.15 s` (`127` tokens).
+- **Not run:** `prepack=1` on v2, full-context (`8K`) speed, the 236-item suite on v2.

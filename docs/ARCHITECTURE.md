@@ -26,11 +26,11 @@ Switching to its Apache-2.0 variable-loop sibling **`thinkingmachines/TML-d24-va
 
 ## 3. Streaming Expert Cache & Known-Route Overlap
 
-All dense weights (`~1.0–1.2 GB`) load eagerly into RAM (`-lm none -lzm on`); only the 48 `ffn_{gate_up,down}_exps.weight` tensors stay lazy/memory-mapped and are streamed through an explicit anonymous-memory LRU cache (`GGML_MMID_CACHE_MB=3000..3250`):
+All dense weights (`~1.0–1.2 GB`) load eagerly into RAM (`-lm none -lzm on`); only the 48 `ffn_{gate_up,down}_exps.weight` tensors stay lazy/memory-mapped and are streamed through an explicit anonymous-memory LRU cache (current recommended `v35d` env on the v2 GGUF: `GGML_MMID_CACHE_MB=2950`, `GGML_MMID_PIN_N=40`, `GGML_MMID_CECAR_BONUS=0.35`, with `GGML_MMID_OVERLAP=1`, `GGML_MMID_REPACK=1`, `GGML_MMID_LRU=1`, `GGML_MMID_IO_THREADS=4`, `GGML_MMID_CECAR_PREFILL=1`; the `v35a` env uses `2700` / `36`; earlier versions of this doc listed `3000..3250`, which crosses the iOS memory-compressor cliff at `-ub 128`, see §7):
 
 1. **Direct `F_NOCACHE` parallel `pread`:** Replaces 16 KB page-fault `memcpy` (~0.2 GB/s) with direct uncached `pread` across reader threads (~0.8–1.2 GB/s), giving a `4.5×` immediate speedup (`961 → 212 ms` at 3p K8).
 2. **Known-Route Paired-`down` Overlap (`GGML_MMID_OVERLAP=1`):** Ported from Atomic Engine's CPU-portable design. Once `blk.L.ffn_gate_up_exps` routes its top-4 experts, the exact same 4 expert IDs are guaranteed to be needed by `blk.L.ffn_down_exps`. Two background reader threads prefetch all missing `down` slices *while* the 2 P-cores compute `gate_up` (`100%` prefetch hit rate, `0` wasted reads). Cut iPhone `-t 2` median latency by **`-40%`** (`119–124 → 72–73 ms`) and CPU heat by **`-33%`**.
-3. **Decode Threading (`-t 2`) vs. Prefill Threading (`-tb 6`):** On A17 Pro's 2P+4E topology, running decode on `-t 4` or `-t 6` burns `1.9–2.5×` CPU heat for no sustained mean win. Locking decode to `-t 2` keeps the SoC cool (`nominal → fair`), while `-tb 6` unlocks all 6 cores with `smmla` GEMM for fast prompt prefill.
+3. **Decode Threading (`-t 2`) vs. Batch/Prefill Threading (`-tb 4`):** On A17 Pro's 2P+4E topology, running decode on `-t 4` or `-t 6` burns `1.9–2.5×` CPU heat for no sustained mean win. Locking decode to `-t 2` keeps the SoC cool (`nominal → fair`), while batch/prefill uses `-tb 4` with `-ub 64` in every `v35`/`v36` run (earlier versions of this doc said `-tb 6`; no `v35`/`v36` run uses it).
 
 ---
 
