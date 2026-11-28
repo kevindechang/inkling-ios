@@ -1,0 +1,234 @@
+system.thermal: nominal
+[gen] loading models/inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf ngl=0 mmap=0 footprint=53 MB
+validate_override: Using metadata override (  int) 'inkling2_loop.expert_used_count' = 4
+validate_override: Using metadata override (  int) 'inkling2_loop.loop.count' = 1
+init_tokenizer: initializing tokenizer for type 2
+load_all_data: buffer type CPU_REPACK is not the default buffer type for device CPU for async uploads
+load_all_data: no device found for buffer type CPU for async uploads
+load_all_data: no device found for buffer type CPU_Mapped for async uploads
+[load] 100% t=1.0s footprint=780 MB
+[gen] loaded t=1.0s footprint=780 MB
+init_rotation:        CPU rotation buffer size =     0.31 MiB
+init_rotation:        CPU rotation buffer size =     1.56 MiB
+resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+resolve_fused_ops: fused DeepSeek V4 HC post enabled
+[gen] context t=1.1s footprint=1196 MB
+[prefill] 64/66 t=4.03s footprint=4314 MB
+[prefill] 66/66 t=4.37s footprint=4314 MB
+[prefill_done] prompt_tokens=66 new_tokens=66 prefill_s=4.366 (15.1 tok/s) tb=4 reused=0
+[mmid] overlap=1 lru=1 coalesce=0 repack=1 prerepacked=0 pin_n=40 budget_mb=2950 hits=1607 misses=2607 read_mb=3620.3 read_calls=2607 wait_ms=3079.7 prefetch_issued=1310 prefetch_used=1310 prefetch_wasted=0 bypass_reads=0 repacked=2607 repack_ms=811.8 cecar_bonus=0.3500 cecar_calls=1584 cecar_swaps=0
+[tok] 0 77 ms footprint=4315 MB cpu_ms=123 hit=1796 miss=2613 miss_mb=3629 cache_mb=2950
+[tok] 1 57 ms footprint=4315 MB cpu_ms=92 hit=190 miss=6 miss_mb=6 cache_mb=2950
+[tok] 2 54 ms footprint=4315 MB cpu_ms=89 hit=190 miss=6 miss_mb=7 cache_mb=2950
+[tok] 3 50 ms footprint=4315 MB cpu_ms=84 hit=190 miss=5 miss_mb=6 cache_mb=2950
+[tok] 4 48 ms footprint=4315 MB cpu_ms=81 hit=191 miss=3 miss_mb=4 cache_mb=2950
+[tok] 5 50 ms footprint=4315 MB cpu_ms=86 hit=190 miss=6 miss_mb=8 cache_mb=2950
+[tok] 6 37 ms footprint=4315 MB cpu_ms=68 hit=192 miss=3 miss_mb=3 cache_mb=2950
+[tok] 7 57 ms footprint=4315 MB cpu_ms=82 hit=185 miss=15 miss_mb=21 cache_mb=2950
+[tok] 8 41 ms footprint=4315 MB cpu_ms=69 hit=191 miss=3 miss_mb=5 cache_mb=2950
+[tok] 9 44 ms footprint=4315 MB cpu_ms=75 hit=191 miss=2 miss_mb=3 cache_mb=2950
+[tok] 10 54 ms footprint=4315 MB cpu_ms=81 hit=187 miss=10 miss_mb=14 cache_mb=2950
+[tok] 11 39 ms footprint=4315 MB cpu_ms=71 hit=190 miss=6 miss_mb=8 cache_mb=2950
+[tok] 12 37 ms footprint=4315 MB cpu_ms=69 hit=191 miss=2 miss_mb=2 cache_mb=2950
+[tok] 13 54 ms footprint=4315 MB cpu_ms=85 hit=188 miss=14 miss_mb=16 cache_mb=2950
+[tok] 14 57 ms footprint=4315 MB cpu_ms=96 hit=191 miss=13 miss_mb=12 cache_mb=2950
+[tok] 15 45 ms footprint=4315 MB cpu_ms=83 hit=192 miss=4 miss_mb=3 cache_mb=2950
+[tok] 16 44 ms footprint=4315 MB cpu_ms=82 hit=192 miss=4 miss_mb=3 cache_mb=2950
+[tok] 17 45 ms footprint=4315 MB cpu_ms=78 hit=191 miss=3 miss_mb=3 cache_mb=2950
+[tok] 18 41 ms footprint=4315 MB cpu_ms=73 hit=191 miss=4 miss_mb=5 cache_mb=2950
+[tok] 19 44 ms footprint=4315 MB cpu_ms=77 hit=191 miss=6 miss_mb=5 cache_mb=2950
+[tok] 20 39 ms footprint=4315 MB cpu_ms=73 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 21 42 ms footprint=4315 MB cpu_ms=75 hit=190 miss=6 miss_mb=6 cache_mb=2950
+[tok] 22 56 ms footprint=4315 MB cpu_ms=90 hit=187 miss=13 miss_mb=16 cache_mb=2950
+[tok] 23 93 ms footprint=4315 MB cpu_ms=142 hit=190 miss=8 miss_mb=10 cache_mb=2950
+[tok] 24 84 ms footprint=4315 MB cpu_ms=129 hit=185 miss=22 miss_mb=27 cache_mb=2950
+[tok] 25 70 ms footprint=4315 MB cpu_ms=108 hit=184 miss=25 miss_mb=28 cache_mb=2950
+[tok] 26 39 ms footprint=4315 MB cpu_ms=74 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 27 51 ms footprint=4315 MB cpu_ms=80 hit=190 miss=7 miss_mb=9 cache_mb=2950
+[tok] 28 38 ms footprint=4315 MB cpu_ms=69 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 29 53 ms footprint=4315 MB cpu_ms=87 hit=191 miss=5 miss_mb=5 cache_mb=2950
+[tok] 30 48 ms footprint=4315 MB cpu_ms=81 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 31 58 ms footprint=4315 MB cpu_ms=94 hit=188 miss=14 miss_mb=15 cache_mb=2950
+[tok] 32 71 ms footprint=4315 MB cpu_ms=91 hit=184 miss=19 miss_mb=28 cache_mb=2950
+[tok] 33 58 ms footprint=4315 MB cpu_ms=86 hit=187 miss=16 miss_mb=18 cache_mb=2950
+[tok] 34 51 ms footprint=4315 MB cpu_ms=81 hit=190 miss=8 miss_mb=8 cache_mb=2950
+[tok] 35 61 ms footprint=4315 MB cpu_ms=87 hit=187 miss=12 miss_mb=19 cache_mb=2950
+[tok] 36 44 ms footprint=4315 MB cpu_ms=72 hit=192 miss=6 miss_mb=4 cache_mb=2950
+[tok] 37 35 ms footprint=4315 MB cpu_ms=65 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 38 45 ms footprint=4315 MB cpu_ms=78 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 39 72 ms footprint=4315 MB cpu_ms=107 hit=189 miss=8 miss_mb=11 cache_mb=2950
+[tok] 40 53 ms footprint=4315 MB cpu_ms=87 hit=192 miss=2 miss_mb=2 cache_mb=2950
+[tok] 41 60 ms footprint=4315 MB cpu_ms=88 hit=189 miss=8 miss_mb=9 cache_mb=2950
+[tok] 42 83 ms footprint=4315 MB cpu_ms=121 hit=189 miss=13 miss_mb=15 cache_mb=2950
+[tok] 43 53 ms footprint=4258 MB cpu_ms=88 hit=192 miss=6 miss_mb=6 cache_mb=2950
+[tok] 44 34 ms footprint=4258 MB cpu_ms=66 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 45 40 ms footprint=4258 MB cpu_ms=72 hit=191 miss=5 miss_mb=5 cache_mb=2950
+[tok] 46 34 ms footprint=4258 MB cpu_ms=67 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 47 45 ms footprint=4258 MB cpu_ms=75 hit=190 miss=7 miss_mb=9 cache_mb=2950
+[tok] 48 41 ms footprint=4258 MB cpu_ms=73 hit=191 miss=6 miss_mb=6 cache_mb=2950
+[tok] 49 42 ms footprint=4258 MB cpu_ms=75 hit=191 miss=9 miss_mb=9 cache_mb=2950
+[tok] 50 41 ms footprint=4258 MB cpu_ms=73 hit=191 miss=4 miss_mb=5 cache_mb=2950
+[tok] 51 49 ms footprint=4258 MB cpu_ms=86 hit=192 miss=4 miss_mb=3 cache_mb=2950
+[tok] 52 66 ms footprint=4258 MB cpu_ms=98 hit=189 miss=14 miss_mb=15 cache_mb=2950
+[tok] 53 67 ms footprint=4258 MB cpu_ms=109 hit=190 miss=7 miss_mb=8 cache_mb=2950
+[tok] 54 45 ms footprint=4258 MB cpu_ms=73 hit=191 miss=8 miss_mb=7 cache_mb=2950
+[tok] 55 43 ms footprint=4258 MB cpu_ms=71 hit=191 miss=5 miss_mb=6 cache_mb=2950
+[tok] 56 40 ms footprint=4258 MB cpu_ms=72 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 57 55 ms footprint=4258 MB cpu_ms=80 hit=188 miss=13 miss_mb=15 cache_mb=2950
+[tok] 58 49 ms footprint=4258 MB cpu_ms=80 hit=192 miss=9 miss_mb=7 cache_mb=2950
+[tok] 59 42 ms footprint=4258 MB cpu_ms=73 hit=192 miss=2 miss_mb=2 cache_mb=2950
+[tok] 60 47 ms footprint=4258 MB cpu_ms=79 hit=191 miss=3 miss_mb=5 cache_mb=2950
+[tok] 61 44 ms footprint=4258 MB cpu_ms=76 hit=191 miss=3 miss_mb=4 cache_mb=2950
+[tok] 62 49 ms footprint=4258 MB cpu_ms=79 hit=191 miss=6 miss_mb=7 cache_mb=2950
+[tok] 63 74 ms footprint=4254 MB cpu_ms=92 hit=184 miss=21 miss_mb=31 cache_mb=2950
+[tok] 64 56 ms footprint=4195 MB cpu_ms=83 hit=187 miss=15 miss_mb=18 cache_mb=2950
+[tok] 65 39 ms footprint=4195 MB cpu_ms=69 hit=191 miss=8 miss_mb=9 cache_mb=2950
+[tok] 66 35 ms footprint=4195 MB cpu_ms=63 hit=192 miss=4 miss_mb=4 cache_mb=2950
+[tok] 67 74 ms footprint=4195 MB cpu_ms=90 hit=180 miss=27 miss_mb=36 cache_mb=2950
+[tok] 68 46 ms footprint=4195 MB cpu_ms=74 hit=189 miss=11 miss_mb=12 cache_mb=2950
+[tok] 69 36 ms footprint=4195 MB cpu_ms=66 hit=192 miss=6 miss_mb=5 cache_mb=2950
+[tok] 70 34 ms footprint=4195 MB cpu_ms=66 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 71 33 ms footprint=4195 MB cpu_ms=64 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 72 48 ms footprint=4195 MB cpu_ms=78 hit=189 miss=10 miss_mb=13 cache_mb=2950
+[tok] 73 35 ms footprint=4195 MB cpu_ms=66 hit=192 miss=4 miss_mb=3 cache_mb=2950
+[tok] 74 35 ms footprint=4195 MB cpu_ms=69 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 75 41 ms footprint=4195 MB cpu_ms=73 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 76 36 ms footprint=4195 MB cpu_ms=67 hit=192 miss=3 miss_mb=2 cache_mb=2950
+[tok] 77 52 ms footprint=4195 MB cpu_ms=81 hit=186 miss=16 miss_mb=21 cache_mb=2950
+[tok] 78 36 ms footprint=4195 MB cpu_ms=67 hit=192 miss=3 miss_mb=3 cache_mb=2950
+[tok] 79 40 ms footprint=4195 MB cpu_ms=70 hit=191 miss=6 miss_mb=5 cache_mb=2950
+[tok] 80 57 ms footprint=4195 MB cpu_ms=83 hit=186 miss=15 miss_mb=20 cache_mb=2950
+[tok] 81 62 ms footprint=4195 MB cpu_ms=84 hit=183 miss=18 miss_mb=26 cache_mb=2950
+[tok] 82 32 ms footprint=4195 MB cpu_ms=62 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 83 53 ms footprint=4195 MB cpu_ms=86 hit=187 miss=13 miss_mb=17 cache_mb=2950
+[tok] 84 75 ms footprint=4195 MB cpu_ms=98 hit=180 miss=24 miss_mb=35 cache_mb=2950
+[tok] 85 45 ms footprint=4195 MB cpu_ms=76 hit=189 miss=8 miss_mb=11 cache_mb=2950
+[tok] 86 37 ms footprint=4195 MB cpu_ms=69 hit=191 miss=4 miss_mb=4 cache_mb=2950
+[tok] 87 39 ms footprint=4195 MB cpu_ms=71 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 88 31 ms footprint=4195 MB cpu_ms=63 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 89 37 ms footprint=4195 MB cpu_ms=66 hit=191 miss=2 miss_mb=3 cache_mb=2950
+[tok] 90 37 ms footprint=4195 MB cpu_ms=66 hit=191 miss=3 miss_mb=5 cache_mb=2950
+[tok] 91 37 ms footprint=4195 MB cpu_ms=71 hit=191 miss=3 miss_mb=3 cache_mb=2950
+[tok] 92 37 ms footprint=4195 MB cpu_ms=70 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 93 46 ms footprint=4195 MB cpu_ms=78 hit=192 miss=10 miss_mb=10 cache_mb=2950
+[tok] 94 44 ms footprint=4195 MB cpu_ms=76 hit=190 miss=7 miss_mb=9 cache_mb=2950
+[tok] 95 39 ms footprint=4195 MB cpu_ms=70 hit=191 miss=5 miss_mb=7 cache_mb=2950
+[tok] 96 40 ms footprint=4195 MB cpu_ms=71 hit=191 miss=4 miss_mb=5 cache_mb=2950
+[tok] 97 47 ms footprint=4195 MB cpu_ms=78 hit=191 miss=9 miss_mb=12 cache_mb=2950
+[tok] 98 35 ms footprint=4195 MB cpu_ms=67 hit=191 miss=2 miss_mb=2 cache_mb=2950
+[tok] 99 44 ms footprint=4195 MB cpu_ms=75 hit=191 miss=6 miss_mb=9 cache_mb=2950
+[tok] 100 31 ms footprint=4195 MB cpu_ms=60 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 101 34 ms footprint=4195 MB cpu_ms=66 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 102 41 ms footprint=4195 MB cpu_ms=72 hit=191 miss=4 miss_mb=6 cache_mb=2950
+[tok] 103 33 ms footprint=4195 MB cpu_ms=63 hit=191 miss=2 miss_mb=2 cache_mb=2950
+[tok] 104 36 ms footprint=4195 MB cpu_ms=68 hit=191 miss=2 miss_mb=3 cache_mb=2950
+[tok] 105 32 ms footprint=4195 MB cpu_ms=63 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 106 33 ms footprint=4195 MB cpu_ms=64 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 107 33 ms footprint=4195 MB cpu_ms=65 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 108 32 ms footprint=4195 MB cpu_ms=64 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 109 34 ms footprint=4195 MB cpu_ms=66 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 110 42 ms footprint=4195 MB cpu_ms=74 hit=190 miss=5 miss_mb=8 cache_mb=2950
+[tok] 111 39 ms footprint=4195 MB cpu_ms=71 hit=191 miss=3 miss_mb=5 cache_mb=2950
+[tok] 112 36 ms footprint=4195 MB cpu_ms=68 hit=191 miss=2 miss_mb=2 cache_mb=2950
+[tok] 113 31 ms footprint=4195 MB cpu_ms=62 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 114 38 ms footprint=4195 MB cpu_ms=68 hit=191 miss=3 miss_mb=4 cache_mb=2950
+[tok] 115 48 ms footprint=4195 MB cpu_ms=80 hit=190 miss=6 miss_mb=6 cache_mb=2950
+[tok] 116 42 ms footprint=4195 MB cpu_ms=78 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 117 32 ms footprint=4195 MB cpu_ms=64 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 118 32 ms footprint=4195 MB cpu_ms=65 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 119 35 ms footprint=4195 MB cpu_ms=68 hit=192 miss=2 miss_mb=2 cache_mb=2950
+[tok] 120 45 ms footprint=4195 MB cpu_ms=76 hit=191 miss=7 miss_mb=9 cache_mb=2950
+[tok] 121 39 ms footprint=4195 MB cpu_ms=73 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 122 49 ms footprint=4195 MB cpu_ms=81 hit=191 miss=13 miss_mb=14 cache_mb=2950
+[tok] 123 46 ms footprint=4195 MB cpu_ms=79 hit=192 miss=9 miss_mb=10 cache_mb=2950
+[tok] 124 38 ms footprint=4195 MB cpu_ms=69 hit=191 miss=7 miss_mb=6 cache_mb=2950
+[tok] 125 37 ms footprint=4195 MB cpu_ms=69 hit=192 miss=4 miss_mb=4 cache_mb=2950
+[tok] 126 45 ms footprint=4195 MB cpu_ms=77 hit=190 miss=10 miss_mb=9 cache_mb=2950
+[tok] 127 47 ms footprint=4195 MB cpu_ms=82 hit=192 miss=12 miss_mb=13 cache_mb=2950
+[tok] 128 42 ms footprint=4195 MB cpu_ms=75 hit=192 miss=7 miss_mb=6 cache_mb=2950
+[tok] 129 33 ms footprint=4195 MB cpu_ms=65 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 130 37 ms footprint=4195 MB cpu_ms=69 hit=192 miss=4 miss_mb=4 cache_mb=2950
+[tok] 131 43 ms footprint=4195 MB cpu_ms=76 hit=192 miss=9 miss_mb=9 cache_mb=2950
+[tok] 132 50 ms footprint=4195 MB cpu_ms=79 hit=190 miss=10 miss_mb=13 cache_mb=2950
+[tok] 133 45 ms footprint=4195 MB cpu_ms=75 hit=190 miss=5 miss_mb=8 cache_mb=2950
+[tok] 134 39 ms footprint=4195 MB cpu_ms=71 hit=191 miss=5 miss_mb=5 cache_mb=2950
+[tok] 135 33 ms footprint=4195 MB cpu_ms=64 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 136 36 ms footprint=4195 MB cpu_ms=69 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 137 33 ms footprint=4195 MB cpu_ms=65 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 138 37 ms footprint=4195 MB cpu_ms=70 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 139 40 ms footprint=4195 MB cpu_ms=73 hit=192 miss=6 miss_mb=4 cache_mb=2950
+[tok] 140 48 ms footprint=4195 MB cpu_ms=79 hit=192 miss=11 miss_mb=11 cache_mb=2950
+[tok] 141 40 ms footprint=4195 MB cpu_ms=73 hit=192 miss=7 miss_mb=5 cache_mb=2950
+[tok] 142 38 ms footprint=4195 MB cpu_ms=70 hit=191 miss=4 miss_mb=4 cache_mb=2950
+[tok] 143 37 ms footprint=4195 MB cpu_ms=68 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 144 41 ms footprint=4195 MB cpu_ms=74 hit=192 miss=6 miss_mb=6 cache_mb=2950
+[tok] 145 37 ms footprint=4195 MB cpu_ms=69 hit=192 miss=3 miss_mb=3 cache_mb=2950
+[tok] 146 33 ms footprint=4195 MB cpu_ms=66 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 147 33 ms footprint=4195 MB cpu_ms=64 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 148 35 ms footprint=4195 MB cpu_ms=66 hit=191 miss=2 miss_mb=3 cache_mb=2950
+[tok] 149 33 ms footprint=4195 MB cpu_ms=66 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 150 32 ms footprint=4195 MB cpu_ms=64 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 151 41 ms footprint=4195 MB cpu_ms=73 hit=191 miss=5 miss_mb=5 cache_mb=2950
+[tok] 152 36 ms footprint=4195 MB cpu_ms=69 hit=192 miss=2 miss_mb=1 cache_mb=2950
+[tok] 153 39 ms footprint=4195 MB cpu_ms=72 hit=192 miss=5 miss_mb=4 cache_mb=2950
+[tok] 154 33 ms footprint=4195 MB cpu_ms=66 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 155 34 ms footprint=4195 MB cpu_ms=65 hit=191 miss=2 miss_mb=3 cache_mb=2950
+[tok] 156 32 ms footprint=4195 MB cpu_ms=63 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 157 34 ms footprint=4195 MB cpu_ms=67 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 158 32 ms footprint=4195 MB cpu_ms=64 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 159 33 ms footprint=4195 MB cpu_ms=65 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 160 33 ms footprint=4195 MB cpu_ms=66 hit=192 miss=0 miss_mb=0 cache_mb=2950
+[tok] 161 37 ms footprint=4195 MB cpu_ms=70 hit=191 miss=3 miss_mb=4 cache_mb=2950
+[tok] 162 35 ms footprint=4195 MB cpu_ms=68 hit=192 miss=1 miss_mb=1 cache_mb=2950
+[tok] 163 38 ms footprint=4195 MB cpu_ms=71 hit=192 miss=5 miss_mb=5 cache_mb=2950
+[tok] 164 38 ms footprint=4195 MB cpu_ms=72 hit=192 miss=3 miss_mb=3 cache_mb=2950
+[tok] 165 38 ms footprint=4195 MB cpu_ms=70 hit=192 miss=4 miss_mb=4 cache_mb=2950
+[tok] 166 41 ms footprint=4195 MB cpu_ms=75 hit=191 miss=8 miss_mb=7 cache_mb=2950
+[tok] 167 42 ms footprint=4195 MB cpu_ms=73 hit=191 miss=6 miss_mb=9 cache_mb=2950
+[tok] 168 40 ms footprint=4195 MB cpu_ms=74 hit=190 miss=6 miss_mb=7 cache_mb=2950
+[tok] 169 62 ms footprint=4195 MB cpu_ms=96 hit=188 miss=20 miss_mb=26 cache_mb=2950
+[tok] 170 48 ms footprint=4195 MB cpu_ms=83 hit=190 miss=10 miss_mb=12 cache_mb=2950
+[tok] 171 39 ms footprint=4195 MB cpu_ms=73 hit=192 miss=3 miss_mb=4 cache_mb=2950
+[tok] 172 48 ms footprint=4195 MB cpu_ms=79 hit=189 miss=8 miss_mb=11 cache_mb=2950
+[tok] 173 53 ms footprint=4195 MB cpu_ms=84 hit=187 miss=13 miss_mb=18 cache_mb=2950
+[tok] 174 51 ms footprint=4195 MB cpu_ms=81 hit=188 miss=13 miss_mb=17 cache_mb=2950
+[tok] 175 38 ms footprint=4195 MB cpu_ms=69 hit=191 miss=4 miss_mb=5 cache_mb=2950
+[tok] 176 52 ms footprint=4195 MB cpu_ms=85 hit=187 miss=12 miss_mb=15 cache_mb=2950
+[tok] 177 42 ms footprint=4195 MB cpu_ms=76 hit=192 miss=6 miss_mb=6 cache_mb=2950
+[tok] 178 41 ms footprint=4195 MB cpu_ms=72 hit=190 miss=4 miss_mb=5 cache_mb=2950
+[tok] 179 41 ms footprint=4195 MB cpu_ms=71 hit=191 miss=6 miss_mb=8 cache_mb=2950
+[tok] 180 52 ms footprint=4195 MB cpu_ms=85 hit=187 miss=12 miss_mb=15 cache_mb=2950
+[tok] 181 37 ms footprint=4195 MB cpu_ms=70 hit=191 miss=4 miss_mb=4 cache_mb=2950
+[tok] 182 44 ms footprint=4195 MB cpu_ms=75 hit=190 miss=7 miss_mb=9 cache_mb=2950
+[tok] 183 50 ms footprint=4195 MB cpu_ms=82 hit=191 miss=13 miss_mb=13 cache_mb=2950
+[tok] 184 44 ms footprint=4195 MB cpu_ms=78 hit=191 miss=7 miss_mb=8 cache_mb=2950
+[tok] 185 42 ms footprint=4195 MB cpu_ms=75 hit=192 miss=8 miss_mb=6 cache_mb=2950
+[tok] 186 46 ms footprint=4195 MB cpu_ms=75 hit=188 miss=11 miss_mb=14 cache_mb=2950
+[tok] 187 72 ms footprint=4195 MB cpu_ms=103 hit=184 miss=25 miss_mb=33 cache_mb=2950
+[tok] 188 49 ms footprint=4195 MB cpu_ms=82 hit=192 miss=13 miss_mb=14 cache_mb=2950
+[tok] 189 53 ms footprint=4195 MB cpu_ms=83 hit=188 miss=14 miss_mb=17 cache_mb=2950
+[tok] 190 52 ms footprint=4195 MB cpu_ms=83 hit=189 miss=13 miss_mb=16 cache_mb=2950
+[tok] 191 44 ms footprint=4195 MB cpu_ms=76 hit=190 miss=9 miss_mb=8 cache_mb=2950
+[tok] 192 45 ms footprint=4195 MB cpu_ms=78 hit=192 miss=9 miss_mb=9 cache_mb=2950
+[tok] 193 43 ms footprint=4195 MB cpu_ms=76 hit=192 miss=7 miss_mb=8 cache_mb=2950
+[tok] 194 39 ms footprint=4195 MB cpu_ms=72 hit=192 miss=4 miss_mb=4 cache_mb=2950
+[tok] 195 51 ms footprint=4195 MB cpu_ms=83 hit=189 miss=11 miss_mb=14 cache_mb=2950
+[tok] 196 47 ms footprint=4195 MB cpu_ms=81 hit=191 miss=10 miss_mb=9 cache_mb=2950
+[tok] 197 54 ms footprint=4195 MB cpu_ms=89 hit=192 miss=13 miss_mb=14 cache_mb=2950
+[tok] 198 49 ms footprint=4195 MB cpu_ms=83 hit=192 miss=10 miss_mb=12 cache_mb=2950
+[tok] 199 44 ms footprint=4195 MB cpu_ms=75 hit=191 miss=8 miss_mb=9 cache_mb=2950
+[mmid] overlap=1 lru=1 coalesce=0 repack=1 prerepacked=0 pin_n=40 budget_mb=2950 hits=39713 misses=3895 read_mb=1481.7 read_calls=1288 wait_ms=1331.4 prefetch_issued=994 prefetch_used=994 prefetch_wasted=0 bypass_reads=0 repacked=1288 repack_ms=404.0 cecar_bonus=0.3500 cecar_calls=4800 cecar_swaps=0
+[warm_ttft] prompt_tokens=40 new_tokens=40 ttft_s=0.740 (54.0 tok/s) tb=4 reused=0
+[mmid] overlap=1 lru=1 coalesce=0 repack=1 prerepacked=0 pin_n=40 budget_mb=2950 hits=41299 misses=4155 read_mb=327.2 read_calls=260 wait_ms=64.0 prefetch_issued=174 prefetch_used=174 prefetch_wasted=0 bypass_reads=0 repacked=260 repack_ms=63.9 cecar_bonus=0.3500 cecar_calls=960 cecar_swaps=0
+[gen] prompt_tokens=66 prefill_s=4.37 (15.1 tok/s) decode_tokens=200 median_ms=42 mean_ms=45 (22.46 tok/s) footprint=4195 MB reused=0
+[text] <|content_thinking|>We need solve math word problem. Need think carefully. Problem: bookstore sells paperback novels for $12 and hardcover books for $25. On Saturday they sold 3 times as many paperbacks as hardcovers and took in $610 total. How many of each did they sell?
+
+Let hardcovers x, paperbacks 3x. Revenue = 12*(3x) + 25*x = 610. Solve: 36x + 25x = 61x = 610 => x = 610/61 = 10. So hardcovers 10, paperbacks 30. Check: paperbacks 3*10=30, revenue 12*30=360, hardcover revenue 25*10=250, total 610. Yes.
+
+Need answer likely with equations. Provide concise.<|end_message|><|message_model|><|content_text|>Let hardcovers be `x`. Then paperbacks are `3x`
+[mmid] overlap=1 lru=1 coalesce=0 repack=1 prerepacked=0 pin_n=40 budget_mb=2950 hits=41299 misses=4155 read_mb=327.2 read_calls=260 wait_ms=64.0 prefetch_issued=174 prefetch_used=174 prefetch_wasted=0 bypass_reads=0 repacked=260 repack_ms=63.9 cecar_bonus=0.3500 cecar_calls=960 cecar_swaps=0
+~llama_context:        CPU compute buffer size is 121.4082 MiB, matches expectation of 121.4082 MiB
+system.thermal.end: nominal
+The app terminated with the exit code 0.
