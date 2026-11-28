@@ -1,0 +1,7 @@
+SYSTEM: You are Inkling, an AI model running fully offline on this iPhone. Think briefly. Answer concisely and accurately, and follow length instructions exactly.
+---
+Explain in 3 short bullet points why running AI on-device helps privacy.
+---
+Now give one downside, in one sentence.
+---
+Write a one-line Python function that reverses a string.

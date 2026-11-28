@@ -1,6 +1,12 @@
 #include <algorithm>
 // Phone/Mac generate command with visibility: load progress, footprint, per-token times.
 // Usage: gen -m model.gguf [-ngl 99] [-n 32] [-c 2048] [-ub 64] [-t 4] [-lm mmap|none] [-lzm on|auto|off] [-cpu <tensor regex>] [-f prompt.txt | -p prompt]
+//        [-temp F] [-top-k N] [-top-p F] [-min-p F] [-repeat-penalty F] [-repeat-last-n N] [-seed N]   (sampling; env INKLING_TEMP/TOP_K/TOP_P/MIN_P/REPEAT_PENALTY/REPEAT_LAST_N/SEED)
+//        [-demo]   (demo mode: on-screen UI hooks + demo sampling defaults; also INKLING_DEMO=1)
+//        [-script turns.txt]   (demo only, also INKLING_DEMO_SCRIPT: multi-turn chat; user turns separated by "---" lines, KV cache kept, -n = per-turn cap;
+//                               a first block starting with "SYSTEM:" is a system message placed before the effort line, not a turn)
+//        env INKLING_THINK_BUDGET=N   (script demo: force-close thinking after N thinking tokens; 0 = off, default 200 with -demo)
+// Default temp=0 and repeat_penalty=1 => greedy path (fused argmax head), logs unchanged.
 #include "llama.h"
 #include "ggml-backend.h"
 #include "../tools/eagle_draft.hpp"
@@ -8,6 +14,7 @@
 #include <sys/resource.h>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -29,6 +36,106 @@ static void usage_now(double & pageins, double & cpu_s) {
     cpu_s = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
 }
 extern "C" void ggml_cpu_mmid_cache_stats(uint64_t * hits, uint64_t * misses, uint64_t * miss_bytes, uint64_t * bytes);
+
+// ---- Demo-mode UI hook (see ios_main.mm). Null callback => no extra work beyond one null check. ----
+// kinds: STATUS text="loading|prefill|generating|..." progress 0..1 | PROMPT text=full prompt file |
+//        TEXT answer chunk | THINK thinking progress (text is always empty, n_tok = thinking tokens so far; thinking text is never sent) | FINAL text="done", n_tok, tok_s, ram_mb
+// Script mode (-script) adds: TURN_BEGIN text=user turn (no template), n_tok=turn index (1-based), progress=turn count |
+//        TURN_END n_tok=decoded tokens of the turn, tok_s, ram_mb.
+//        FINAL then carries total decode tokens, average tok/s and peak RAM; text is "done" or a "stopped: ..." note.
+// Demo numbers: every tok_s is the steady decode rate = (ALL generated tokens, thinking + answer, after the first 3 of the turn)
+// / (their summed per-token llama_decode ms), 0 until more than 3 tokens were decoded (UI shows "—"); script FINAL carries total steady
+// tokens / total steady decode time. Time to first token (turn prefill start -> first generated token available, s) rides
+// in `progress` of: STATUS "generating" (sent once, when known), TEXT/THINK (0 = not yet known), TURN_END and the
+// single-turn FINAL.
+enum { INKLING_UI_STATUS = 0, INKLING_UI_PROMPT = 1, INKLING_UI_TEXT = 2, INKLING_UI_FINAL = 3, INKLING_UI_THINK = 4,
+       INKLING_UI_TURN_BEGIN = 5, INKLING_UI_TURN_END = 6 };
+typedef void (*inkling_ui_cb)(int kind, const char * text, int n_tok, double tok_s, double ram_mb, float progress);
+static inkling_ui_cb g_ui_cb = nullptr;
+extern "C" void inkling_set_ui_callback(inkling_ui_cb cb) { g_ui_cb = cb; }
+
+static void ui_status(const char * s, float progress, int n_tok = 0, double tok_s = 0.0) {
+    if (g_ui_cb) g_ui_cb(INKLING_UI_STATUS, s, n_tok, tok_s, footprint_mb(), progress);
+}
+
+// Accumulates generated answer pieces for the UI; flushes every 4 tokens or ~100 ms, and on thinking/answer switches.
+// Thinking text is not forwarded: while thinking it only sends THINK events (empty text, n_tok = thinking tokens so far).
+static const size_t kDemoSkipTok = 3;   // demo "steady" decode rate excludes the first 3 decoded tokens of each turn
+struct SteadyStats {
+    size_t n = 0; double ms = 0.0;
+    double tok_s() const { return n > 0 && ms > 0.0 ? 1000.0 * (double) n / ms : 0.0; }
+};
+static SteadyStats steady_of(const std::vector<double> & ms) {
+    SteadyStats s;
+    for (size_t i = kDemoSkipTok; i < ms.size(); ++i) { s.n++; s.ms += ms[i]; }
+    return s;
+}
+
+struct InklingUiStream {
+    std::string buf;
+    bool thinking = false;
+    int n = 0, pend = 0, think_n = 0;
+    double last = 0.0;
+    const std::vector<double> * dec_ms = nullptr;   // per-token llama_decode ms of this turn (same values as the [gen]/[turn] lines)
+    size_t acc_i = kDemoSkipTok;                    // next index of dec_ms to add to acc_ms (steady part only)
+    double acc_ms = 0.0, ttft = 0.0;
+
+    void start(const std::vector<double> * ms) {
+        n = pend = think_n = 0; buf.clear(); thinking = false; last = now_s();
+        dec_ms = ms; acc_i = kDemoSkipTok; acc_ms = 0.0; ttft = 0.0;
+    }
+    void first_token(double ttft_s) { ttft = ttft_s; ui_status("generating", (float) ttft_s); }
+    double steady_tok_s() {
+        if (!dec_ms) return 0.0;
+        while (acc_i < dec_ms->size()) acc_ms += (*dec_ms)[acc_i++];
+        const size_t cnt = acc_i - kDemoSkipTok;
+        return cnt > 0 && acc_ms > 0.0 ? 1000.0 * (double) cnt / acc_ms : 0.0;
+    }
+    static size_t complete_len(const std::string & s) {   // do not split a UTF-8 sequence across flushes
+        const size_t sz = s.size();
+        for (size_t back = 1; back <= 3 && back <= sz; ++back) {
+            const unsigned char c = (unsigned char) s[sz - back];
+            if ((c & 0xC0) == 0x80) continue;
+            const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            return need > back ? sz - back : sz;
+        }
+        return sz;
+    }
+    void send_think() {
+        g_ui_cb(INKLING_UI_THINK, "", think_n, steady_tok_s(), footprint_mb(), (float) ttft);
+        pend = 0; last = now_s();
+    }
+    void end_thinking() { flush(true); thinking = false; }   // thinking closed by something other than a sampled token
+    void flush(bool force) {
+        if (thinking) { if (think_n > 0 && pend > 0) send_think(); return; }
+        const size_t len = force ? buf.size() : complete_len(buf);
+        if (len == 0) return;
+        const double now = now_s();
+        const std::string chunk = buf.substr(0, len);
+        buf.erase(0, len);
+        g_ui_cb(INKLING_UI_TEXT, chunk.c_str(), n, steady_tok_s(), footprint_mb(), (float) ttft);
+        pend = 0; last = now;
+    }
+    void token(const llama_vocab * vocab, llama_token tk) {
+        n++;
+        char sp[256];
+        const int k = llama_token_to_piece(vocab, tk, sp, sizeof sp, 0, true);
+        bool marker = false;
+        if (k > 2 && sp[0] == '<' && sp[1] == '|') {
+            const std::string s(sp, (size_t) k);
+            if (s == "<|content_thinking|>") { flush(true); thinking = true; marker = true; }
+            else if (s == "<|content_text|>" || s == "<|end_message|>") { flush(true); thinking = false; marker = true; }
+        }
+        if (thinking) {
+            if (!marker) think_n++;   // thinking text is dropped, only counted
+        } else {
+            char pc[256];
+            const int j = llama_token_to_piece(vocab, tk, pc, sizeof pc, 0, false);
+            if (j > 0) buf.append(pc, (size_t) j);
+        }
+        if (++pend >= 4 || now_s() - last >= 0.1) flush(false);
+    }
+};
 
 // Prompts are separated by a line that is exactly "---". Each prompt is prefilled, then n_gen greedy tokens.
 static int run_prompt_sweep(llama_context * ctx, const llama_vocab * vocab, const std::string & path, int n_gen, int n_ub) {
@@ -85,9 +192,184 @@ extern "C" void ggml_cpu_mmid_stats_reset(void);
 extern "C" void ggml_cpu_mmid_stats_dump(void);
 extern "C" void ggml_cpu_node_prof_dump(void);
 extern "C" void ggml_cpu_node_prof_reset(void);
+
+// ---- Demo script mode: multi-turn chat with the KV cache kept between turns (demo + -script only). ----
+// Script file: plain-text user turns (no chat template) separated by lines that are exactly "---".
+// If the first block starts with "SYSTEM:", it is returned in `system` (prefix and following whitespace stripped) and is not a turn.
+static bool read_script_turns(const std::string & path, std::vector<std::string> & turns, std::string & system) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    auto trim = [](const std::string & s) -> std::string {
+        const char * ws = " \t\r\n";
+        const size_t b = s.find_first_not_of(ws);
+        if (b == std::string::npos) return std::string();
+        return s.substr(b, s.find_last_not_of(ws) - b + 1);
+    };
+    std::string cur, line;
+    bool first = true;
+    auto push = [&]() {
+        const std::string t = trim(cur);
+        cur.clear();
+        if (t.empty()) return;
+        if (first && t.compare(0, 7, "SYSTEM:") == 0) system = trim(t.substr(7));
+        else turns.push_back(t);
+        first = false;
+    };
+    std::istringstream ls(all);
+    while (std::getline(ls, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "---") push();
+        else { cur += line; cur.push_back('\n'); }
+    }
+    push();
+    return true;
+}
+
+static bool tokenize_text(const llama_vocab * vocab, const std::string & s, bool add_special, std::vector<llama_token> & out) {
+    out.assign(s.size() + 16, 0);
+    int n = llama_tokenize(vocab, s.c_str(), (int) s.size(), out.data(), (int) out.size(), add_special, true);
+    if (n < 0) {
+        out.assign((size_t) -n, 0);
+        n = llama_tokenize(vocab, s.c_str(), (int) s.size(), out.data(), (int) out.size(), add_special, true);
+        if (n < 0) return false;
+    }
+    out.resize((size_t) n);
+    return true;
+}
+
+static int run_demo_script(llama_context * ctx, const llama_vocab * vocab, llama_sampler * smpl,
+                           const std::vector<std::string> & turns, const std::string & system, int n_gen, int n_ub, int think_budget) {
+    const int n_ctx = (int) llama_n_ctx(ctx);
+    const int N = (int) turns.size();
+    int n_past = 0, turns_done = 0;
+    llama_token pending = LLAMA_TOKEN_NULL;   // EOG token sampled at the end of the last reply, not yet decoded into the cache
+    size_t total_tok = 0, total_steady_n = 0;
+    double total_ms = 0.0, total_steady_ms = 0.0, sum_turn_tok_s = 0.0, peak = footprint_mb();
+    int rc = 0;
+    std::string stop_note;
+    fprintf(stderr, "[demo] script turns=%d n_ctx=%d per_turn_cap=%d system_chars=%zu think_budget=%d\n", N, n_ctx, n_gen, system.size(), think_budget);
+    ggml_cpu_node_prof_reset();
+    for (int ti = 0; ti < N; ++ti) {
+        std::string add;
+        if (ti == 0) {
+            if (!system.empty()) add = "<|message_system|><|content_text|>" + system + "<|end_message|>";
+            add += "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|>";
+        } else if (pending == LLAMA_TOKEN_NULL) {   // previous reply hit the cap: close it by hand
+            add = "<|end_message|><|content_model_end_sampling|>";
+        }
+        add += "<|message_user|><|content_text|>" + turns[ti] + "<|end_message|><|message_model|>";
+        std::vector<llama_token> in;
+        if (pending != LLAMA_TOKEN_NULL) in.push_back(pending);
+        std::vector<llama_token> tail;
+        if (!tokenize_text(vocab, add, ti == 0, tail)) { fprintf(stderr, "[demo] tokenize failed turn %d\n", ti + 1); return 2; }
+        in.insert(in.end(), tail.begin(), tail.end());
+        const int n_in = (int) in.size();
+        if (n_past + n_in + 1 > n_ctx) {
+            char msg[160];
+            snprintf(msg, sizeof msg, "stopped: context full before turn %d/%d", ti + 1, N);
+            stop_note = msg;
+            fprintf(stderr, "[demo] %s (needs %d tokens, %d/%d used)\n", msg, n_in, n_past, n_ctx);
+            break;
+        }
+        if (smpl) llama_sampler_reset(smpl);
+        if (g_ui_cb) g_ui_cb(INKLING_UI_TURN_BEGIN, turns[ti].c_str(), ti + 1, 0.0, footprint_mb(), (float) N);
+        if (ti > 0) ggml_cpu_mmid_stats_reset();
+        if (g_ui_cb) ui_status("prefill", 0.0f);
+        double t = now_s();
+        const double t_pf0 = t;   // turn TTFT starts here (start of this turn's prefill)
+        double ttft_s = 0.0;
+        for (int i = 0; i < n_in; i += n_ub) {
+            const int n = std::min(n_ub, n_in - i);
+            if (llama_decode(ctx, llama_batch_get_one(in.data() + i, n)) != 0) {
+                fprintf(stderr, "[demo] prefill failed turn %d\n", ti + 1); rc = 2; break;
+            }
+            if (g_ui_cb) ui_status("prefill", (float) (i + n) / (float) n_in);
+        }
+        if (rc != 0) break;
+        const double prefill_s = now_s() - t;
+        n_past += n_in;
+        pending = LLAMA_TOKEN_NULL;
+        peak = std::max(peak, footprint_mb());
+        ggml_cpu_mmid_stats_dump();
+        ggml_cpu_mmid_stats_reset();
+
+        std::vector<double> ms;
+        std::string text;
+        InklingUiStream ui;
+        if (g_ui_cb) { ui.start(&ms); ui_status("generating", 0.0f); }
+        int gen_max = std::min(n_gen, n_ctx - n_past);
+        bool in_think = false;
+        int think_tok = 0;   // thinking tokens generated so far this turn
+        for (int g = 0; g < gen_max; ++g) {
+            llama_token best = smpl ? llama_sampler_sample(smpl, ctx, -1) : llama_get_greedy_token_ith(ctx, -1);
+            if (g == 0) { ttft_s = now_s() - t_pf0; if (g_ui_cb) ui.first_token(ttft_s); }
+            if (llama_vocab_is_eog(vocab, best)) { pending = best; break; }
+            char buf[256]; const int k = llama_token_to_piece(vocab, best, buf, sizeof buf, 0, true);
+            const std::string sp = (k > 2 && buf[0] == '<' && buf[1] == '|') ? std::string(buf, (size_t) k) : std::string();
+            const bool ends_think = sp == "<|content_text|>" || sp == "<|end_message|>";
+            if (think_budget > 0 && in_think && think_tok >= think_budget && !ends_think) {
+                // budget reached while still thinking: drop the sampled token and decode the closing sequence in its place
+                static const char kClose[] = "<|end_message|><|message_model|><|content_text|>";
+                std::vector<llama_token> ft;
+                if (!tokenize_text(vocab, kClose, false, ft)) { fprintf(stderr, "[demo] tokenize failed (think close) turn %d\n", ti + 1); rc = 2; break; }
+                const int nf = (int) ft.size();
+                if (n_past + nf + 1 > n_ctx) break;
+                for (int i = 0; i < nf; i += n_ub) {
+                    const int nb = std::min(n_ub, nf - i);
+                    if (llama_decode(ctx, llama_batch_get_one(ft.data() + i, nb)) != 0) { fprintf(stderr, "[demo] decode failed (think close) turn %d\n", ti + 1); rc = 3; break; }
+                }
+                if (rc != 0) break;
+                n_past += nf;
+                text += kClose;
+                in_think = false;
+                if (g_ui_cb) ui.end_thinking();
+                gen_max = std::min(gen_max, g + 1 + (n_ctx - n_past));   // keep the remaining samples inside the context
+                fprintf(stderr, "[think_budget] turn=%d forced_close_at=%d\n", ti + 1, think_tok);
+                continue;
+            }
+            if (sp == "<|content_thinking|>") in_think = true;
+            else if (in_think && ends_think) in_think = false;
+            else if (in_think) think_tok++;
+            if (k > 0) text.append(buf, (size_t) k);
+            if (g_ui_cb) ui.token(vocab, best);
+            t = now_s();
+            if (llama_decode(ctx, llama_batch_get_one(&best, 1)) != 0) { fprintf(stderr, "[demo] decode failed turn %d\n", ti + 1); rc = 3; break; }
+            ms.push_back((now_s() - t) * 1000.0);
+            n_past++;
+            peak = std::max(peak, footprint_mb());
+        }
+        if (g_ui_cb) ui.flush(true);
+        if (rc != 0) break;
+        std::vector<double> s = ms; std::sort(s.begin(), s.end());
+        double sum = 0; for (double x : ms) sum += x;
+        const double turn_tok_s = ms.empty() ? 0.0 : 1000.0 * ms.size() / sum;
+        const SteadyStats st = steady_of(ms);
+        fprintf(stderr, "[turn] i=%d/%d prompt_tokens=%d prefill_s=%.2f decode_tokens=%zu median_ms=%.0f mean_ms=%.0f (%.2f tok/s) ctx_used=%d footprint=%.0f MB steady_tok_s=%.2f ttft_s=%.3f think_tokens=%d\n",
+                ti + 1, N, n_in, prefill_s, ms.size(), s.empty() ? 0.0 : s[s.size() / 2], ms.empty() ? 0.0 : sum / ms.size(),
+                turn_tok_s, n_past, footprint_mb(), st.tok_s(), ttft_s, think_tok);
+        fprintf(stderr, "[turn_text] i=%d %s\n", ti + 1, text.c_str());
+        ggml_cpu_mmid_stats_dump();
+        total_tok += ms.size(); total_ms += sum;
+        total_steady_n += st.n; total_steady_ms += st.ms;
+        if (!ms.empty()) sum_turn_tok_s += turn_tok_s;
+        turns_done++;
+        if (g_ui_cb) g_ui_cb(INKLING_UI_TURN_END, "", (int) ms.size(), st.tok_s(), footprint_mb(), (float) ttft_s);
+    }
+    const double avg_tok_s = total_ms > 0.0 ? 1000.0 * total_tok / total_ms : 0.0;
+    const double avg_steady_tok_s = total_steady_ms > 0.0 ? 1000.0 * (double) total_steady_n / total_steady_ms : 0.0;
+    fprintf(stderr, "[demo] turns=%d total_decode_tokens=%zu avg_tok_s=%.2f mean_of_turn_tok_s=%.2f peak_footprint=%.0f MB avg_steady_tok_s=%.2f\n",
+            turns_done, total_tok, avg_tok_s, turns_done > 0 ? sum_turn_tok_s / turns_done : 0.0, peak, avg_steady_tok_s);
+    if (g_ui_cb && rc == 0) g_ui_cb(INKLING_UI_FINAL, stop_note.empty() ? "done" : stop_note.c_str(), (int) total_tok, avg_steady_tok_s, peak, 1.0f);
+    ggml_cpu_node_prof_dump();
+    return rc;
+}
+
 static double g_t0, g_last;
+static double g_ui_last_load = 0;
 static bool on_progress(float p, void *) {
     const double t = now_s();
+    if (g_ui_cb && (t - g_ui_last_load > 0.1 || p >= 1.0f)) { g_ui_last_load = t; ui_status("loading", p); }
     if (t - g_last > 2.0 || p >= 1.0f) { g_last = t; fprintf(stderr, "[load] %.0f%% t=%.1fs footprint=%.0f MB\n", p * 100, t - g_t0, footprint_mb()); fflush(stderr); }
     return true;
 }
@@ -127,10 +409,15 @@ static int inkling_decode_batch_all_logits(llama_context * ctx, const llama_toke
 }
 
 int inkling_gen(int argc, char ** argv) {
-    std::string lora, state_save, state_load, warm_prompt, vbench_file, vbench_sizes, eagle_path, prompts_file, ctk = "f16", ctv = "f16";   // -lora <file>: GGUF LoRA adapter applied at scale 1
+    std::string script_path, lora, state_save, state_load, warm_prompt, vbench_file, vbench_sizes, eagle_path, prompts_file, ctk = "f16", ctv = "f16";   // -lora <file>: GGUF LoRA adapter applied at scale 1
     std::string model, prompt = "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>Give me three short tips for sleeping better.<|end_message|><|message_model|>";
     int ngl = 99, n_gen = 32, n_ctx = 2048, n_ub = 64, threads = 4, threads_batch = 0, n_draft = 1; bool use_mmap = true; std::string cpu_pat; int passes = 0, n_used = 0; llama_lazy_mode lazy = LLAMA_LAZY_MODE_AUTO;
-    for (int i = 1; i + 1 < argc; i += 2) {
+    bool demo = false, prompt_file_failed = false; int think_budget = 0;
+    float temp = 0.0f, top_p = 1.0f, min_p = 0.0f, repeat_penalty = 1.0f; int top_k = 0, repeat_last_n = 64; uint32_t seed = LLAMA_DEFAULT_SEED;
+    bool have_temp = false, have_top_k = false, have_top_p = false, have_min_p = false, have_rp = false, have_rln = false, have_seed = false;
+    for (int i = 1; i < argc; i += 2) {
+        if (strcmp(argv[i], "-demo") == 0) { demo = true; i--; continue; }   // value-less flag
+        if (i + 1 >= argc) break;
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "-m") model = v; else if (a == "-lora") lora = v; else if (a == "-ngl") ngl = std::stoi(v); else if (a == "-n") n_gen = std::stoi(v);
         else if (a == "-c") n_ctx = std::stoi(v); else if (a == "-ub") n_ub = std::stoi(v); else if (a == "-t") threads = std::stoi(v);
@@ -141,12 +428,62 @@ int inkling_gen(int argc, char ** argv) {
         else if (a == "-vbench") vbench_sizes = v;
         else if (a == "-lm") use_mmap = v != "none"; else if (a == "-cpu") cpu_pat = v; else if (a == "-passes") passes = std::stoi(v); else if (a == "-k") n_used = std::stoi(v); else if (a == "-p") prompt = v;
         else if (a == "-lzm") lazy = v == "on" ? LLAMA_LAZY_MODE_ON : v == "off" ? LLAMA_LAZY_MODE_OFF : LLAMA_LAZY_MODE_AUTO;
-        else if (a == "-f") { std::ifstream f(v); std::stringstream ss; ss << f.rdbuf(); prompt = ss.str(); }
+        else if (a == "-f") { std::ifstream f(v); if (!f) prompt_file_failed = true; std::stringstream ss; ss << f.rdbuf(); prompt = ss.str(); }
         else if (a == "-prompts") prompts_file = v;
+        else if (a == "-script") script_path = v;
         else if (a == "-wf") { std::ifstream f(v); std::stringstream ss; ss << f.rdbuf(); warm_prompt = ss.str(); }
         else if (a == "-wp") warm_prompt = v;
         else if (a == "-state-save") state_save = v; else if (a == "-state-load") state_load = v;
+        else if (a == "-temp") { temp = std::stof(v); have_temp = true; }
+        else if (a == "-top-k") { top_k = std::stoi(v); have_top_k = true; }
+        else if (a == "-top-p") { top_p = std::stof(v); have_top_p = true; }
+        else if (a == "-min-p") { min_p = std::stof(v); have_min_p = true; }
+        else if (a == "-repeat-penalty") { repeat_penalty = std::stof(v); have_rp = true; }
+        else if (a == "-repeat-last-n") { repeat_last_n = std::stoi(v); have_rln = true; }
+        else if (a == "-seed") { seed = (uint32_t) std::stoull(v); have_seed = true; }
     }
+    {   // sampling: args win over INKLING_* env, env wins over demo defaults, then the greedy defaults
+        const char * ed = getenv("INKLING_DEMO");
+        if (ed && strcmp(ed, "1") == 0) demo = true;
+        auto env_s = [](const char * n) -> const char * { const char * e = getenv(n); return e && e[0] ? e : nullptr; };
+        const char * e;
+        if (!have_temp)   { if ((e = env_s("INKLING_TEMP")))           temp = strtof(e, nullptr);           else if (demo) temp = 0.35f; }
+        if (!have_top_k)  { if ((e = env_s("INKLING_TOP_K")))          top_k = atoi(e);                     else if (demo) top_k = 40; }
+        if (!have_top_p)  { if ((e = env_s("INKLING_TOP_P")))          top_p = strtof(e, nullptr);          else if (demo) top_p = 0.9f; }
+        if (!have_min_p)  { if ((e = env_s("INKLING_MIN_P")))          min_p = strtof(e, nullptr);          else if (demo) min_p = 0.05f; }
+        if (!have_rp)     { if ((e = env_s("INKLING_REPEAT_PENALTY"))) repeat_penalty = strtof(e, nullptr); else if (demo) repeat_penalty = 1.08f; }
+        if (!have_rln)    { if ((e = env_s("INKLING_REPEAT_LAST_N")))  repeat_last_n = atoi(e);             else if (demo) repeat_last_n = 128; }
+        if (!have_seed)   { if ((e = env_s("INKLING_SEED")))           seed = (uint32_t) strtoull(e, nullptr, 10); }
+        think_budget = demo ? 200 : 0;
+        if ((e = env_s("INKLING_THINK_BUDGET"))) think_budget = atoi(e);
+    }
+    bool sampling = temp > 0.0f || repeat_penalty != 1.0f;
+    if (sampling && !prompts_file.empty()) {
+        fprintf(stderr, "[sampling] ignored with -prompts (greedy sweep)\n");
+        sampling = false;
+    }
+    if (sampling) {
+        if (!eagle_path.empty()) { fprintf(stderr, "[sampling] eagle disabled (greedy only)\n"); eagle_path.clear(); }
+        // the skip-softcap shortcut is only valid for argmax; sampling needs the true (soft-capped) logits
+        if (getenv("INKLING_GREEDY_SKIP_SOFTCAP")) { fprintf(stderr, "[sampling] INKLING_GREEDY_SKIP_SOFTCAP ignored\n"); unsetenv("INKLING_GREEDY_SKIP_SOFTCAP"); }
+    }
+    std::vector<std::string> script_turns;
+    std::string script_system;   // optional "SYSTEM:" first block of the script
+    bool script_mode = false;   // demo + script: multi-turn chat, KV cache kept between turns
+    if (demo) {
+        if (script_path.empty()) { const char * es = getenv("INKLING_DEMO_SCRIPT"); if (es && es[0]) script_path = es; }
+        if (!script_path.empty()) {
+            if (!read_script_turns(script_path, script_turns, script_system)) { fprintf(stderr, "[demo] script open failed %s\n", script_path.c_str()); return 2; }
+            if (script_turns.empty()) { fprintf(stderr, "[demo] script has no turns %s\n", script_path.c_str()); return 2; }
+            script_mode = true;
+            if (!eagle_path.empty()) { fprintf(stderr, "[demo] eagle disabled in script mode\n"); eagle_path.clear(); }
+        }
+    }
+    if (demo && prompt_file_failed && !script_mode) {
+        prompt = "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>Explain in simple terms how a phone can run a large AI model without the internet.<|end_message|><|message_model|>";
+        fprintf(stderr, "[demo] prompt file missing, using built-in prompt\n");
+    }
+    if (g_ui_cb) { if (!script_mode) g_ui_cb(INKLING_UI_PROMPT, prompt.c_str(), 0, 0.0, 0.0, 0.0f); ui_status("loading", 0.0f); }
     if (threads_batch <= 0) threads_batch = threads;
     setvbuf(stdout, nullptr, _IOLBF, 0);
     g_t0 = g_last = now_s();
@@ -195,7 +532,7 @@ int inkling_gen(int argc, char ** argv) {
     }
     llama_context * ctx = llama_init_from_model(m, cp);
     if (!ctx) { fprintf(stderr, "[gen] context failed\n"); return 1; }
-    llama_set_greedy_head(ctx, true);
+    if (!sampling) llama_set_greedy_head(ctx, true);   // the fused argmax head may skip full logits; sampling needs them
     if (!lora.empty()) {
         llama_adapter_lora * adapter = llama_adapter_lora_init(m, lora.c_str());
         float scale = 1.0f;
@@ -204,14 +541,34 @@ int inkling_gen(int argc, char ** argv) {
     }
     fprintf(stderr, "[gen] context t=%.1fs footprint=%.0f MB\n", now_s() - g_t0, footprint_mb());
     const llama_vocab * vocab = llama_model_get_vocab(m);
+    llama_sampler * smpl = nullptr;
+    if (sampling) {
+        smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), repeat_last_n, repeat_penalty, 0.0f, 0.0f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed));
+        fprintf(stderr, "[sampling] temp=%g top_k=%d top_p=%g min_p=%g repeat_penalty=%g last_n=%d seed=%u\n",
+                temp, top_k, top_p, min_p, repeat_penalty, repeat_last_n, (unsigned) seed);
+    }
     if (!prompts_file.empty()) {
         const int rc = run_prompt_sweep(ctx, vocab, prompts_file, n_gen, n_ub);
+        llama_free(ctx); llama_model_free(m);
+        return rc;
+    }
+    if (script_mode) {
+        const int rc = run_demo_script(ctx, vocab, smpl, script_turns, script_system, n_gen, n_ub, think_budget);
+        if (smpl) llama_sampler_free(smpl);
         llama_free(ctx); llama_model_free(m);
         return rc;
     }
     std::vector<llama_token> toks(prompt.size() + 16);
     toks.resize(llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), (int) toks.size(), true, true));
     double t = now_s();
+    const double ttft_t0 = t;   // demo TTFT starts with the prompt prefill (model load excluded)
+    double ttft_s = 0.0;
     size_t start = 0, reused = 0;
     if (!state_load.empty()) {
         std::vector<llama_token> saved(std::max<size_t>(llama_n_ctx(ctx), toks.size()));
@@ -232,9 +589,11 @@ int inkling_gen(int argc, char ** argv) {
     }
     std::vector<float> eagle_prompt_h;
     if (use_eagle) eagle_prompt_h.reserve(toks.size() * (size_t) eagle_cap.n_embd);
+    if (g_ui_cb) ui_status("prefill", 0.0f);
     for (size_t i = start; i < toks.size(); i += n_ub) {
         const int n = (int) std::min<size_t>(n_ub, toks.size() - i);
         if (llama_decode(ctx, llama_batch_get_one(toks.data() + i, n)) != 0) { fprintf(stderr, "[gen] prefill failed\n"); return 2; }
+        if (g_ui_cb) ui_status("prefill", (float) (i + n) / (float) toks.size());
         if (use_eagle && eagle_cap.n_cap == n) {
             eagle_prompt_h.insert(eagle_prompt_h.end(), eagle_cap.h_buf.begin(), eagle_cap.h_buf.end());
         }
@@ -253,6 +612,8 @@ int inkling_gen(int argc, char ** argv) {
     ggml_cpu_node_prof_reset();   // profile decode only
     ggml_cpu_mmid_stats_reset();  // measure decode-only wait_ms / read_mb / repack_ms
     std::string text; std::vector<double> ms;
+    InklingUiStream ui;
+    if (g_ui_cb) { ui.start(&ms); ui_status("generating", 0.0f); }
     if (use_eagle && eagle_prompt_h.size() >= (size_t) eagle_cap.n_embd) {
         const int H = eagle_cap.n_embd;
         const int n_ph = (int) (eagle_prompt_h.size() / (size_t) H);
@@ -264,6 +625,7 @@ int inkling_gen(int argc, char ** argv) {
         }
         std::vector<float> h_last(eagle_prompt_h.end() - H, eagle_prompt_h.end());
         llama_token tok_cur = llama_get_greedy_token_ith(ctx, -1);
+        if (demo) { ttft_s = now_s() - ttft_t0; if (g_ui_cb) ui.first_token(ttft_s); }
         int cur_pos = (int) toks.size();
         int n_emitted = 0, total_steps = 0, acc1_hits = 0, acc1_tot = 0, acc2_hits = 0, acc2_tot = 0;
         double sum_draft_ms = 0.0, sum_verify_ms = 0.0;
@@ -272,6 +634,7 @@ int inkling_gen(int argc, char ** argv) {
             char buf[256];
             const int k = llama_token_to_piece(vocab, tk, buf, sizeof buf, 0, true);
             if (k > 0) text.append(buf, k);
+            if (g_ui_cb) ui.token(vocab, tk);
         };
         if (!llama_vocab_is_eog(vocab, tok_cur)) {
             append_tok(tok_cur);
@@ -353,10 +716,12 @@ int inkling_gen(int argc, char ** argv) {
                 100.0 * acc1_hits / std::max(1, acc1_tot), 100.0 * acc2_hits / std::max(1, acc2_tot),
                 sum_draft_ms / std::max(1, total_steps), sum_verify_ms / std::max(1, total_steps), footprint_mb());
     } else for (int g = 0; g < n_gen; g++) {
-        llama_token best = llama_get_greedy_token_ith(ctx, -1);
+        llama_token best = smpl ? llama_sampler_sample(smpl, ctx, -1) : llama_get_greedy_token_ith(ctx, -1);
+        if (demo && g == 0) { ttft_s = now_s() - ttft_t0; if (g_ui_cb) ui.first_token(ttft_s); }
         if (llama_vocab_is_eog(vocab, best)) break;
         char buf[256]; const int k = llama_token_to_piece(vocab, best, buf, sizeof buf, 0, true);
         if (k > 0) text.append(buf, k);
+        if (g_ui_cb) ui.token(vocab, best);
         double pi0, cpu0, pi1, cpu1; usage_now(pi0, cpu0);
         t = now_s();
         if (llama_decode(ctx, llama_batch_get_one(&best, 1)) != 0) { fprintf(stderr, "[gen] decode failed\n"); return 3; }
@@ -444,9 +809,17 @@ int inkling_gen(int argc, char ** argv) {
     fprintf(stderr, "[gen] prompt_tokens=%zu prefill_s=%.2f (%.1f tok/s) decode_tokens=%zu median_ms=%.0f mean_ms=%.0f (%.2f tok/s) footprint=%.0f MB reused=%zu\n",
            toks.size(), prefill_s, toks.size() / prefill_s, ms.size(), s.empty() ? 0 : s[s.size() / 2], ms.empty() ? 0 : sum / ms.size(),
            ms.empty() ? 0 : 1000.0 * ms.size() / sum, footprint_mb(), reused);
+    const SteadyStats demo_st = steady_of(ms);
+    if (demo) fprintf(stderr, "[demo_turn] steady_tok_s=%.2f ttft_s=%.3f\n", demo_st.tok_s(), ttft_s);
     fprintf(stderr, "[text] %s\n", text.c_str());
+    if (g_ui_cb) {
+        ui.flush(true);
+        if (demo) g_ui_cb(INKLING_UI_FINAL, "done", (int) ms.size(), demo_st.tok_s(), footprint_mb(), (float) ttft_s);
+        else g_ui_cb(INKLING_UI_FINAL, "done", (int) ms.size(), ms.empty() ? 0.0 : 1000.0 * ms.size() / sum, footprint_mb(), 1.0f);
+    }
     ggml_cpu_node_prof_dump();
     ggml_cpu_mmid_stats_dump();
+    if (smpl) llama_sampler_free(smpl);
     llama_free(ctx); llama_model_free(m);
     return 0;
 }

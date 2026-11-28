@@ -46,12 +46,14 @@ fi
 : "${IOS_SIGN_IDENTITY:?set IOS_SIGN_IDENTITY}"
 : "${IOS_PROVISION_PROFILE:?set IOS_PROVISION_PROFILE}"
 
+# libggml-cpu.a moved from ggml/src/ggml-cpu/ to ggml/src/ in newer llama.cpp trees; accept either.
+CPU_LIB="$B/ggml/src/ggml-cpu/libggml-cpu.a"; [ -f "$CPU_LIB" ] || CPU_LIB="$B/ggml/src/libggml-cpu.a"
 APP=$HERE/build/InklingBench.app
 mkdir -p "$APP"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 xcrun --sdk iphoneos clang++ -target arm64-apple-ios"$MIN_IOS" -march="$ARM_ARCH" -isysroot "$SDK" -std=c++17 -O2 -fobjc-arc \
   -I"$L/include" -I"$L/ggml/include" -I"$HERE/../tools" "$HERE/ios_main.mm" "$HERE/inkling_run.cpp" \
-  "$B/src/libllama.a" "$B/ggml/src/libggml.a" "$B/ggml/src/ggml-cpu/libggml-cpu.a" "$B/ggml/src/libggml-base.a" \
+  "$B/src/libllama.a" "$B/ggml/src/libggml.a" "$CPU_LIB" "$B/ggml/src/libggml-base.a" \
   -framework UIKit -framework Foundation -framework Accelerate \
   -o "$APP/InklingBench"
 
