@@ -6,6 +6,8 @@
 //   rm <relpath>            delete a file under Documents/
 // Demo mode (launch with no args, `gen ... -demo`, or INKLING_DEMO=1): on-screen UI that streams the generated text,
 // demo sampling defaults, and the app stays open after generation unless INKLING_DEMO_EXIT=1.
+// With `-script <file>` / INKLING_DEMO_SCRIPT (or models/demo_script.txt when tapped) the demo is a multi-turn chat
+// that keeps the KV cache between turns.
 #import <UIKit/UIKit.h>
 #include <os/proc.h>
 #include <pthread.h>
@@ -19,10 +21,16 @@
 int inkling_gen(int argc, char ** argv);
 
 // Demo UI hook implemented in inkling_run.cpp (called on the inference thread).
-// kinds: 0 status/progress, 1 prompt, 2 answer text chunk, 3 final stats, 4 thinking text chunk
+// kinds: 0 status/progress, 1 prompt, 2 answer text chunk, 3 final stats, 4 thinking text chunk,
+//        5 turn begin (script mode: text=user turn, n_tok=turn index 1-based, progress=turn count),
+//        6 turn end (n_tok=decoded tokens, tok_s, progress=TTFT s). In script mode kind 3 carries total tokens, average steady
+//        tok/s and peak RAM; its text is "done" or a "stopped: ..." note.
+// tok_s is the steady decode rate (tokens after the first 3 of the turn / their summed per-token llama_decode time), 0 = not
+// available yet (shown as "—"). Time to first token (s, turn prefill start -> first generated token) arrives in `progress` of
+// status "generating" (once known), kinds 2/4 (0 = not yet known), kind 6 and the single-turn kind 3.
 typedef void (*inkling_ui_cb)(int kind, const char * text, int n_tok, double tok_s, double ram_mb, float progress);
 extern "C" void inkling_set_ui_callback(inkling_ui_cb cb);
-enum { UI_STATUS = 0, UI_PROMPT = 1, UI_TEXT = 2, UI_FINAL = 3, UI_THINK = 4 };
+enum { UI_STATUS = 0, UI_PROMPT = 1, UI_TEXT = 2, UI_FINAL = 3, UI_THINK = 4, UI_TURN_BEGIN = 5, UI_TURN_END = 6 };
 
 static int g_argc;
 static char ** g_argv;
@@ -42,7 +50,15 @@ static void detect_demo() {
         g_demo = g_demo_noargs = true;
         g_demo_args_store = {"gen", "-m", "models/inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf", "-ngl", "0", "-t", "2", "-tb", "4",
                              "-ub", "64", "-passes", "1", "-k", "4", "-lm", "none", "-lzm", "on", "-c", "8192", "-ctk", "q8_0",
-                             "-ctv", "q8_0", "-n", "400", "-f", "models/demo_prompt.txt", "-demo"};
+                             "-ctv", "q8_0", "-n", "320"};
+        bool have_script = false;   // models/demo_script.txt => multi-turn chat, else the single-turn demo prompt
+        @autoreleasepool {
+            NSString * docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            have_script = docs && [[NSFileManager defaultManager] fileExistsAtPath:[docs stringByAppendingPathComponent:@"models/demo_script.txt"]];
+        }
+        if (have_script) { g_demo_args_store.push_back("-script"); g_demo_args_store.push_back("models/demo_script.txt"); }
+        else { g_demo_args_store.push_back("-f"); g_demo_args_store.push_back("models/demo_prompt.txt"); }
+        g_demo_args_store.push_back("-demo");
         for (auto & a : g_demo_args_store) g_demo_argv.push_back((char *) a.c_str());
         g_demo_argv.push_back(nullptr);
         g_argc = (int) g_demo_args_store.size();
@@ -82,13 +98,18 @@ static void demo_setenv() {
 
 @implementation InklingDemoVC {
     UILabel * _stats;
-    UILabel * _prompt;
-    UITextView * _text;
+    UIScrollView * _scroll;
+    UIStackView * _chat;
+    UILabel * _modelLabel;                    // answer bubble of the turn in flight
+    UILabel * _footer;                        // "NNN tok · decode XX.X tok/s (excl. first 3) · TTFT X.XX s" under that bubble
+    NSMutableAttributedString * _modelAttr;
+    BOOL _modelHasText;
     NSString * _status;
-    int _nTok;
-    double _tokS, _ram;
+    NSString * _finalNote;
+    int _nTok, _turn, _turnCount, _turnsDone;
+    double _tokS, _ram, _ttft;
     float _progress;
-    bool _done;
+    bool _done, _script;
     int _lastKind;
 }
 
@@ -120,19 +141,19 @@ static void demo_setenv() {
     _stats = [self makeLabel:[UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightMedium]
                        color:[UIColor colorWithRed:0.45 green:0.85 blue:0.60 alpha:1.0] lines:2];
     _stats.text = @"loading 0%";
-    _prompt = [self makeLabel:[UIFont systemFontOfSize:15] color:dim lines:5];
-    _text = [UITextView new];
-    _text.translatesAutoresizingMaskIntoConstraints = NO;
-    _text.editable = NO;
-    _text.backgroundColor = UIColor.clearColor;
-    _text.textColor = fg;
-    _text.font = [UIFont systemFontOfSize:17];
-    _text.textContainerInset = UIEdgeInsetsMake(8, 0, 8, 0);
-    _text.textContainer.lineFragmentPadding = 0;
-    _text.alwaysBounceVertical = YES;
-    _text.indicatorStyle = UIScrollViewIndicatorStyleWhite;
 
-    for (UIView * v in @[title, sub, _stats, _prompt, _text]) [self.view addSubview:v];
+    _scroll = [UIScrollView new];
+    _scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    _scroll.alwaysBounceVertical = YES;
+    _scroll.indicatorStyle = UIScrollViewIndicatorStyleWhite;
+    _chat = [UIStackView new];
+    _chat.translatesAutoresizingMaskIntoConstraints = NO;
+    _chat.axis = UILayoutConstraintAxisVertical;
+    _chat.alignment = UIStackViewAlignmentFill;
+    _chat.spacing = 12;
+    [_scroll addSubview:_chat];
+
+    for (UIView * v in @[title, sub, _stats, _scroll]) [self.view addSubview:v];
     UILayoutGuide * g = self.view.safeAreaLayoutGuide;
     const CGFloat pad = 20;
     [NSLayoutConstraint activateConstraints:@[
@@ -145,13 +166,15 @@ static void demo_setenv() {
         [_stats.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:14],
         [_stats.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
         [_stats.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
-        [_prompt.topAnchor constraintEqualToAnchor:_stats.bottomAnchor constant:14],
-        [_prompt.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
-        [_prompt.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
-        [_text.topAnchor constraintEqualToAnchor:_prompt.bottomAnchor constant:10],
-        [_text.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
-        [_text.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
-        [_text.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-8],
+        [_scroll.topAnchor constraintEqualToAnchor:_stats.bottomAnchor constant:10],
+        [_scroll.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
+        [_scroll.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
+        [_scroll.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-8],
+        [_chat.topAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.topAnchor constant:4],
+        [_chat.bottomAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.bottomAnchor constant:-12],
+        [_chat.leadingAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.leadingAnchor],
+        [_chat.trailingAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.trailingAnchor],
+        [_chat.widthAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.widthAnchor],
     ]];
     _status = @"loading";
     _lastKind = -1;
@@ -172,62 +195,194 @@ static NSString * extract_user_prompt(NSString * raw) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
+static NSString * fmt_decode(double v) { return v > 0 ? [NSString stringWithFormat:@"%.1f", v] : @"\u2014"; }
+static NSString * fmt_ttft(double v) { return v > 0 ? [NSString stringWithFormat:@"%.2f", v] : @"\u2014"; }
+
 - (void)refreshStats {
     NSString * line;
-    if (_done) {
-        line = [NSString stringWithFormat:@"done \u00b7 %.1f tok/s \u00b7 RAM %.0f MB", _tokS, _ram];
+    if ([_status hasPrefix:@"error"]) {
+        line = _status;
+    } else if (_done && _script) {
+        NSString * head = (_finalNote.length && ![_finalNote isEqualToString:@"done"]) ? _finalNote : @"done";
+        line = [NSString stringWithFormat:@"%@ \u00b7 %d turns \u00b7 decode avg %@ tok/s (excl. first 3 tok/turn) \u00b7 peak RAM %.0f MB",
+                head, _turnsDone, fmt_decode(_tokS), _ram];
+    } else if (_done) {
+        line = [NSString stringWithFormat:@"done \u00b7 %d tok \u00b7 decode %@ tok/s (excl. first 3) \u00b7 TTFT %@ s \u00b7 RAM %.0f MB",
+                _nTok, fmt_decode(_tokS), fmt_ttft(_ttft), _ram];
+    } else if (_script && [_status isEqualToString:@"prefill"]) {
+        line = [NSString stringWithFormat:@"turn %d/%d \u00b7 prefill %.0f%% \u00b7 RAM %.0f MB", _turn, _turnCount, _progress * 100.0f, _ram];
+    } else if (_script) {
+        line = [NSString stringWithFormat:@"turn %d/%d \u00b7 %d tok \u00b7 decode %@ tok/s \u00b7 TTFT %@ s \u00b7 RAM %.0f MB",
+                _turn, _turnCount, _nTok, fmt_decode(_tokS), fmt_ttft(_ttft), _ram];
     } else if ([_status isEqualToString:@"loading"] || [_status isEqualToString:@"prefill"]) {
         line = [NSString stringWithFormat:@"%@ %.0f%% \u00b7 RAM %.0f MB", _status, _progress * 100.0f, _ram];
-    } else if ([_status hasPrefix:@"error"]) {
-        line = _status;
     } else {
-        line = [NSString stringWithFormat:@"%@ \u00b7 %d tok \u00b7 %.1f tok/s \u00b7 RAM %.0f MB", _status, _nTok, _tokS, _ram];
+        line = [NSString stringWithFormat:@"%@ \u00b7 %d tok \u00b7 decode %@ tok/s \u00b7 TTFT %@ s \u00b7 RAM %.0f MB",
+                _status, _nTok, fmt_decode(_tokS), fmt_ttft(_ttft), _ram];
     }
     _stats.text = line;
 }
 
+// ---- chat view ----
+
+- (void)scrollToBottom {
+    if (_scroll.isDragging || _scroll.isDecelerating) return;   // do not fight the user's finger
+    [self.view layoutIfNeeded];
+    const UIEdgeInsets in = _scroll.adjustedContentInset;
+    const CGFloat y = _scroll.contentSize.height - _scroll.bounds.size.height + in.bottom;
+    if (y > -in.top) [_scroll setContentOffset:CGPointMake(0, y) animated:NO];
+}
+
+- (UIView *)bubbleWith:(UILabel *)label color:(UIColor *)color {
+    UIView * b = [UIView new];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    b.backgroundColor = color;
+    b.layer.cornerRadius = 14;
+    b.layer.masksToBounds = YES;
+    [b addSubview:label];
+    [NSLayoutConstraint activateConstraints:@[
+        [label.topAnchor constraintEqualToAnchor:b.topAnchor constant:10],
+        [label.bottomAnchor constraintEqualToAnchor:b.bottomAnchor constant:-10],
+        [label.leadingAnchor constraintEqualToAnchor:b.leadingAnchor constant:14],
+        [label.trailingAnchor constraintEqualToAnchor:b.trailingAnchor constant:-14],
+    ]];
+    return b;
+}
+
+- (NSAttributedString *)dimString:(NSString *)s {
+    return [[NSAttributedString alloc] initWithString:s attributes:@{
+        NSForegroundColorAttributeName: [UIColor colorWithWhite:0.52 alpha:1.0],
+        NSFontAttributeName: [UIFont italicSystemFontOfSize:14]}];
+}
+
+- (void)addUserBubble:(NSString *)text {
+    UILabel * l = [self makeLabel:[UIFont systemFontOfSize:17] color:UIColor.whiteColor lines:0];
+    l.lineBreakMode = NSLineBreakByWordWrapping;
+    l.text = text;
+    UIView * b = [self bubbleWith:l color:[UIColor colorWithRed:0.14 green:0.24 blue:0.42 alpha:1.0]];
+    UIView * row = [UIView new];
+    [row addSubview:b];
+    [NSLayoutConstraint activateConstraints:@[
+        [b.topAnchor constraintEqualToAnchor:row.topAnchor],
+        [b.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+        [b.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [b.leadingAnchor constraintGreaterThanOrEqualToAnchor:row.leadingAnchor constant:48],
+    ]];
+    [_chat addArrangedSubview:row];
+}
+
+- (void)addModelBubble {
+    _modelLabel = [self makeLabel:[UIFont systemFontOfSize:17] color:UIColor.whiteColor lines:0];
+    _modelLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    _modelLabel.attributedText = [self dimString:@"\u2026"];
+    UIView * b = [self bubbleWith:_modelLabel color:[UIColor colorWithWhite:0.14 alpha:1.0]];
+    _footer = [self makeLabel:[UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightRegular]
+                        color:[UIColor colorWithWhite:0.5 alpha:1.0] lines:1];
+    _footer.hidden = YES;
+    UIStackView * col = [[UIStackView alloc] initWithArrangedSubviews:@[b, _footer]];
+    col.translatesAutoresizingMaskIntoConstraints = NO;
+    col.axis = UILayoutConstraintAxisVertical;
+    col.alignment = UIStackViewAlignmentFill;
+    col.spacing = 4;
+    UIView * row = [UIView new];
+    [row addSubview:col];
+    [NSLayoutConstraint activateConstraints:@[
+        [col.topAnchor constraintEqualToAnchor:row.topAnchor],
+        [col.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+        [col.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [col.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-28],
+    ]];
+    [_chat addArrangedSubview:row];
+    _modelAttr = [NSMutableAttributedString new];
+    _modelHasText = NO;
+    _lastKind = -1;
+}
+
+- (void)beginTurn:(int)k of:(int)n user:(NSString *)user {
+    _turn = k; _turnCount = n; _nTok = 0; _tokS = 0; _ttft = 0;
+    [self addUserBubble:user ?: @""];
+    [self addModelBubble];
+    [self scrollToBottom];
+}
+
+- (void)finishTurnTok:(int)n tokS:(double)tokS ttft:(double)ttft {
+    if (!_modelLabel) return;
+    if (!_modelHasText) _modelLabel.attributedText = [self dimString:@"(empty reply)"];
+    _footer.text = [NSString stringWithFormat:@"%d tok \u00b7 decode %@ tok/s (excl. first 3) \u00b7 TTFT %@ s",
+                    n, fmt_decode(tokS), fmt_ttft(ttft)];
+    _footer.hidden = NO;
+    _modelLabel = nil; _footer = nil; _modelAttr = nil;
+    [self scrollToBottom];
+}
+
+- (void)addNote:(NSString *)note {
+    UILabel * l = [self makeLabel:[UIFont systemFontOfSize:13] color:[UIColor colorWithWhite:0.5 alpha:1.0] lines:0];
+    l.lineBreakMode = NSLineBreakByWordWrapping;
+    l.textAlignment = NSTextAlignmentCenter;
+    l.text = note;
+    [_chat addArrangedSubview:l];
+    [self scrollToBottom];
+}
+
 - (void)appendChunk:(NSString *)chunk thinking:(BOOL)thinking {
+    if (!_modelLabel) return;
     UIColor * color = thinking ? [UIColor colorWithWhite:0.52 alpha:1.0] : [UIColor colorWithWhite:0.94 alpha:1.0];
-    UIFont * font = [UIFont systemFontOfSize:17];
-    NSMutableAttributedString * add = [NSMutableAttributedString new];
+    UIFont * font = thinking ? [UIFont italicSystemFontOfSize:14] : [UIFont systemFontOfSize:17];
+    NSDictionary * attrs = @{NSForegroundColorAttributeName: color, NSFontAttributeName: font};
     int kind = thinking ? UI_THINK : UI_TEXT;
     if (_lastKind != kind) {
         if (thinking) {
-            [add appendAttributedString:[[NSAttributedString alloc] initWithString:@"thinking\u2026 "
-                attributes:@{NSForegroundColorAttributeName: color, NSFontAttributeName: font}]];
+            [_modelAttr appendAttributedString:[[NSAttributedString alloc] initWithString:@"thinking\u2026 " attributes:attrs]];
         } else if (_lastKind == UI_THINK) {
-            [add appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n\n"
-                attributes:@{NSForegroundColorAttributeName: color, NSFontAttributeName: font}]];
+            [_modelAttr appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n\n" attributes:attrs]];
         }
         _lastKind = kind;
     }
-    [add appendAttributedString:[[NSAttributedString alloc] initWithString:chunk
-        attributes:@{NSForegroundColorAttributeName: color, NSFontAttributeName: font}]];
-    [_text.textStorage appendAttributedString:add];
-    [_text scrollRangeToVisible:NSMakeRange(_text.textStorage.length, 0)];
+    [_modelAttr appendAttributedString:[[NSAttributedString alloc] initWithString:chunk attributes:attrs]];
+    _modelHasText = YES;
+    _modelLabel.attributedText = _modelAttr;
+    [self scrollToBottom];
 }
 
 - (void)handleKind:(int)kind text:(NSString *)text nTok:(int)n tokS:(double)tokS ramMB:(double)ram progress:(float)p {
     switch (kind) {
-        case UI_PROMPT:
-            _prompt.text = extract_user_prompt(text ?: @"");
+        case UI_PROMPT:   // single-turn demo: one user bubble + one reply
+            [self beginTurn:1 of:1 user:extract_user_prompt(text ?: @"")];
             return;
+        case UI_TURN_BEGIN:
+            _script = true;
+            [self beginTurn:n of:(int) (p + 0.5f) user:text];
+            _status = @"prefill";
+            _progress = 0;
+            if (ram > 0) _ram = ram;
+            break;
+        case UI_TURN_END:
+            _turnsDone++;
+            _ttft = p;
+            [self finishTurnTok:n tokS:tokS ttft:p];
+            if (ram > 0) _ram = ram;
+            break;
         case UI_STATUS:
             _status = text ?: @"";
             _progress = p;
             if (ram > 0) _ram = ram;
             if (n > 0) _nTok = n;
             if (tokS > 0) _tokS = tokS;
+            if ([_status isEqualToString:@"generating"] && p > 0) _ttft = p;   // TTFT, sent once the first token exists
             break;
         case UI_TEXT:
         case UI_THINK:
             if (text.length) [self appendChunk:text thinking:kind == UI_THINK];
             _status = @"generating";
             _nTok = n; _tokS = tokS; if (ram > 0) _ram = ram;
+            if (p > 0) _ttft = p;
             break;
         case UI_FINAL:
             _done = true;
+            _finalNote = text;
             _nTok = n; _tokS = tokS; if (ram > 0) _ram = ram;
+            if (!_script) { if (p > 0) _ttft = p; [self finishTurnTok:n tokS:tokS ttft:_ttft]; }
+            else if (text.length && ![text isEqualToString:@"done"]) [self addNote:text];
             break;
     }
     [self refreshStats];
@@ -275,7 +430,7 @@ static void * run_cli(void *) {
         int a0 = g_demo_noargs ? 0 : (g_argc > 1 && strcmp(g_argv[1], "--") == 0) ? 2 : 1;
         if (a0 >= g_argc) {
             printf("usage: info | probe | gen <args...> | rm <path>\n");
-            printf("gen sampling/demo args: -temp F -top-k N -top-p F -min-p F -repeat-penalty F -repeat-last-n N -seed N -demo\n");
+            printf("gen sampling/demo args: -temp F -top-k N -top-p F -min-p F -repeat-penalty F -repeat-last-n N -seed N -demo -script <file>\n");
         } else {
             const char * cmd = g_argv[a0];
             if (strcmp(cmd, "info") == 0) {

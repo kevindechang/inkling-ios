@@ -194,9 +194,33 @@ To eliminate runtime CPU repacking on miss-heavy / multi-topic workloads (`repac
 
 ## Demo mode (on-screen UI)
 
-Tap the app icon (no launch arguments) to run the demo: the app runs `gen` with `models/inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf` and `models/demo_prompt.txt` (falls back to a built-in prompt if the file is missing), applies the `v35d` environment (`GGML_MMID_*`, `INKLING_ALLOW_ONE_PASS=1`, `INKLING_GREEDY_SKIP_SOFTCAP=1`, ... set only if not already in the environment), and shows a dark screen with the title, a live stats line (status, tokens, tok/s, RAM), the user prompt, and the generated text streaming live. When generation finishes the app stays open (for screen recording) unless `INKLING_DEMO_EXIT=1`.
+Tap the app icon (no launch arguments) to run the demo: the app runs `gen` with `models/inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf` and, if `models/demo_script.txt` exists, the multi-turn script below, otherwise `models/demo_prompt.txt` (falls back to a built-in prompt if the file is missing), applies the `v35d` environment (`GGML_MMID_*`, `INKLING_ALLOW_ONE_PASS=1`, `INKLING_GREEDY_SKIP_SOFTCAP=1`, ... set only if not already in the environment), and shows a dark screen with the title, a live stats line (tokens, decode tok/s, TTFT, RAM), and the conversation streaming live (user prompt bubble, model reply bubble). When generation finishes the app stays open (for screen recording) unless `INKLING_DEMO_EXIT=1`.
 
 You can also launch demo mode from `ios/phone_env.sh` with explicit args by adding `-demo` to the `gen` command or setting `INKLING_DEMO=1`. The prompt file must already contain the chat template, e.g. `<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>QUESTION<|end_message|><|message_model|>`.
+
+### Scripted multi-turn chat
+
+`-script <path>` (or `INKLING_DEMO_SCRIPT=<path>`; demo mode only) plays a scripted chat. The file holds plain-text user turns with **no chat template**, separated by lines that are exactly `---`; whitespace around each turn is trimmed and empty turns are ignored:
+
+```
+Give me three short tips for sleeping better.
+---
+Which of those matters most, and why?
+---
+Turn that into a one-line reminder.
+```
+
+- Tap-to-run (no launch args) uses `models/demo_script.txt` in the app's Documents if it exists, else the single-turn `-f models/demo_prompt.txt` demo. `-n` is the per-turn generation cap (tap-to-run default 320).
+- The first turn gets the system header plus the user turn in the Inkling 2 chat template. History stays in the KV cache: later turns are not re-prefilled. Only the end of the previous reply (the sampled EOG token, or `<|end_message|><|content_model_end_sampling|>` if the reply hit the `-n` cap) and `<|message_user|><|content_text|>{turn}<|end_message|><|message_model|>` are decoded. The sampler (repeat penalty history) is reset every turn. The script stops early, with a message on stderr and in the UI, if the next turn would not fit in `-c`.
+- The UI is a chat view: right-aligned user bubbles (shown as each turn starts), left-aligned model bubbles (dim italic thinking part, white answer, a `NNN tok · decode XX.X tok/s (excl. first 3) · TTFT X.XX s` footer when the turn ends), and a status line `turn K/N · prefill NN% · RAM MMMM MB` during prefill, then `turn K/N · NNN tok · decode XX.X tok/s · TTFT X.XX s · RAM MMMM MB`, ending in `done · N turns · decode avg XX.X tok/s (excl. first 3 tok/turn) · peak RAM MMMM MB`. The EAGLE path is disabled in script mode.
+- stderr gets one `[turn] i=K/N prompt_tokens=.. prefill_s=.. decode_tokens=.. median_ms=.. mean_ms=.. (X tok/s) ctx_used=.. footprint=.. MB steady_tok_s=.. ttft_s=..` line and one `[turn_text] i=K ...` line per turn, then `[demo] turns=N total_decode_tokens=.. avg_tok_s=.. mean_of_turn_tok_s=.. peak_footprint=.. MB avg_steady_tok_s=..`.
+
+### What the on-screen numbers mean
+
+- **decode tok/s** is a steady-state decode rate, computed from the same per-token `llama_decode` times as the bench `[gen]`/`[turn]` lines: (tokens decoded after the first 3 of the turn) / (sum of their decode times). The first 3 tokens of every turn are excluded (warm-up). It reads `—` until more than 3 tokens have been decoded in the turn. It is not a cumulative wall-clock average and does not include prefill or sampling time. The `done` line's `decode avg` is total steady tokens / total steady decode time across all turns.
+- **TTFT** (time to first token) is shown separately: wall time from the start of that turn's prefill (turn 1: the start of prompt prefill; model load is excluded) until the first generated token is available. It therefore includes prefill. Later turns only prefill the new user turn, since the KV cache is kept.
+- **RAM** is the process physical footprint (peak on the `done` line).
+- Demo-only log additions: `steady_tok_s=` and `ttft_s=` on each `[turn]` line, `avg_steady_tok_s=` on the `[demo]` line, and in single-turn demo mode an extra `[demo_turn] steady_tok_s=.. ttft_s=..` line after `[gen]` (the `[gen]` line itself is unchanged and still reports the all-token tok/s). `0.00` means no steady tokens (3 or fewer decoded).
 
 Sampling is off by default (greedy, fused argmax head). It is enabled when `temp > 0` or `repeat_penalty != 1`; the EAGLE path is disabled while sampling. Args win over env vars; in demo mode, unset values take the demo defaults.
 
@@ -210,7 +234,7 @@ Sampling is off by default (greedy, fused argmax head). It is enabled when `temp
 | `-repeat-last-n N` | `INKLING_REPEAT_LAST_N` | 64 | 128 |
 | `-seed N` | `INKLING_SEED` | random | random |
 
-Other demo switches: `-demo` / `INKLING_DEMO=1`, `INKLING_DEMO_EXIT=1` (exit after generation as in bench runs).
+Other demo switches: `-demo` / `INKLING_DEMO=1`, `-script` / `INKLING_DEMO_SCRIPT`, `INKLING_DEMO_EXIT=1` (exit after generation as in bench runs).
 
 Bench runs (no `-demo`, temp 0, repeat penalty 1) are unchanged: same greedy code path, same logs, same exit behaviour.
 
