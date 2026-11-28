@@ -2,4 +2,4 @@ Write the opening paragraph of a short story about a lighthouse keeper who finds
 ---
 Nice. Now make it shorter and funnier.
 ---
-Last question: you are a large AI model running entirely on this phone. How is that possible without an internet connection? Answer in two sentences.
+Quick Python question: what does len([1, 2, 3]) return? Answer in one sentence.
