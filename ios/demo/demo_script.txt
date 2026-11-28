@@ -1,5 +1,7 @@
-Write the opening paragraph of a short story about a lighthouse keeper who finds a message in a bottle.
+SYSTEM: You are Inkling, an AI model running fully offline on this iPhone. Think briefly. Answer concisely and accurately, and follow length instructions exactly.
 ---
-Nice. Now make it shorter and funnier.
+Explain in 3 short bullet points why running AI on-device helps privacy.
 ---
-Quick Python question: what does len([1, 2, 3]) return? Answer in one sentence.
+Now give one downside, in one sentence.
+---
+Write a one-line Python function that reverses a string.

@@ -210,14 +210,22 @@ Which of those matters most, and why?
 Turn that into a one-line reminder.
 ```
 
-- Tap-to-run (no launch args) uses `models/demo_script.txt` in the app's Documents if it exists, else the single-turn `-f models/demo_prompt.txt` demo. `-n` is the per-turn generation cap (tap-to-run default 320).
+Optional system message: if the first block starts with `SYSTEM:`, it is not a user turn. Its text (prefix and following whitespace stripped) becomes a system message placed **before** the effort line in turn 1: `<|message_system|><|content_text|>{system}<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|>`. The turn count `N` does not include it. Without `SYSTEM:` nothing changes.
+
+```
+SYSTEM: You are a concise assistant. Answer in at most three sentences.
+---
+Give me three short tips for sleeping better.
+```
+
+- Tap-to-run (no launch args) uses `models/demo_script.txt` in the app's Documents if it exists, else the single-turn `-f models/demo_prompt.txt` demo. `-n` is the per-turn generation cap (tap-to-run default 600).
 - The first turn gets the system header plus the user turn in the Inkling 2 chat template. History stays in the KV cache: later turns are not re-prefilled. Only the end of the previous reply (the sampled EOG token, or `<|end_message|><|content_model_end_sampling|>` if the reply hit the `-n` cap) and `<|message_user|><|content_text|>{turn}<|end_message|><|message_model|>` are decoded. The sampler (repeat penalty history) is reset every turn. The script stops early, with a message on stderr and in the UI, if the next turn would not fit in `-c`.
-- The UI is a chat view: right-aligned user bubbles (shown as each turn starts), left-aligned model bubbles (dim italic thinking part, white answer, a `NNN tok · decode XX.X tok/s (excl. first 3) · TTFT X.XX s` footer when the turn ends), and a status line `turn K/N · prefill NN% · RAM MMMM MB` during prefill, then `turn K/N · NNN tok · decode XX.X tok/s · TTFT X.XX s · RAM MMMM MB`, ending in `done · N turns · decode avg XX.X tok/s (excl. first 3 tok/turn) · peak RAM MMMM MB`. The EAGLE path is disabled in script mode.
-- stderr gets one `[turn] i=K/N prompt_tokens=.. prefill_s=.. decode_tokens=.. median_ms=.. mean_ms=.. (X tok/s) ctx_used=.. footprint=.. MB steady_tok_s=.. ttft_s=..` line and one `[turn_text] i=K ...` line per turn, then `[demo] turns=N total_decode_tokens=.. avg_tok_s=.. mean_of_turn_tok_s=.. peak_footprint=.. MB avg_steady_tok_s=..`.
+- The UI is a chat view: right-aligned user bubbles (shown as each turn starts), left-aligned model bubbles (a single dim `thinking… N tok` line that updates in place (the thinking text itself is never shown), then the white answer, a `NNN tok · decode XX.X tok/s (all tokens, excl. first 3) · TTFT X.XX s` footer when the turn ends), and a status line `turn K/N · prefill NN% · RAM MMMM MB` during prefill, then `turn K/N · NNN tok · decode XX.X tok/s · TTFT X.XX s · RAM MMMM MB`, ending in `done · N turns · decode avg XX.X tok/s (all tokens, excl. first 3/turn) · peak RAM MMMM MB`. The EAGLE path is disabled in script mode.
+- stderr gets one `[turn] i=K/N prompt_tokens=.. prefill_s=.. decode_tokens=.. median_ms=.. mean_ms=.. (X tok/s) ctx_used=.. footprint=.. MB steady_tok_s=.. ttft_s=.. think_tokens=..` line and one `[turn_text] i=K ...` line per turn (the thinking text is still printed there), then `[demo] turns=N total_decode_tokens=.. avg_tok_s=.. mean_of_turn_tok_s=.. peak_footprint=.. MB avg_steady_tok_s=..`.
 
 ### What the on-screen numbers mean
 
-- **decode tok/s** is a steady-state decode rate, computed from the same per-token `llama_decode` times as the bench `[gen]`/`[turn]` lines: (tokens decoded after the first 3 of the turn) / (sum of their decode times). The first 3 tokens of every turn are excluded (warm-up). It reads `—` until more than 3 tokens have been decoded in the turn. It is not a cumulative wall-clock average and does not include prefill or sampling time. The `done` line's `decode avg` is total steady tokens / total steady decode time across all turns.
+- **decode tok/s** is a steady-state decode rate, computed from the same per-token `llama_decode` times as the bench `[gen]`/`[turn]` lines: (all generated tokens, thinking + answer, after the first 3 of the turn) / (sum of their decode times). The first 3 tokens of every turn are excluded (warm-up). It reads `—` until more than 3 tokens have been decoded in the turn. It is not a cumulative wall-clock average and does not include prefill or sampling time. The `done` line's `decode avg` is total steady tokens / total steady decode time across all turns.
 - **TTFT** (time to first token) is shown separately: wall time from the start of that turn's prefill (turn 1: the start of prompt prefill; model load is excluded) until the first generated token is available. It therefore includes prefill. Later turns only prefill the new user turn, since the KV cache is kept.
 - **RAM** is the process physical footprint (peak on the `done` line).
 - Demo-only log additions: `steady_tok_s=` and `ttft_s=` on each `[turn]` line, `avg_steady_tok_s=` on the `[demo]` line, and in single-turn demo mode an extra `[demo_turn] steady_tok_s=.. ttft_s=..` line after `[gen]` (the `[gen]` line itself is unchanged and still reports the all-token tok/s). `0.00` means no steady tokens (3 or fewer decoded).
@@ -226,13 +234,15 @@ Sampling is off by default (greedy, fused argmax head). It is enabled when `temp
 
 | Arg | Env var | Default | Demo default |
 |---|---|---|---|
-| `-temp F` | `INKLING_TEMP` | 0 | 0.7 |
+| `-temp F` | `INKLING_TEMP` | 0 | 0.35 |
 | `-top-k N` | `INKLING_TOP_K` | 0 (off) | 40 |
 | `-top-p F` | `INKLING_TOP_P` | 1.0 | 0.9 |
 | `-min-p F` | `INKLING_MIN_P` | 0.0 | 0.05 |
-| `-repeat-penalty F` | `INKLING_REPEAT_PENALTY` | 1.0 | 1.1 |
+| `-repeat-penalty F` | `INKLING_REPEAT_PENALTY` | 1.0 | 1.08 |
 | `-repeat-last-n N` | `INKLING_REPEAT_LAST_N` | 64 | 128 |
 | `-seed N` | `INKLING_SEED` | random | random |
+
+**Thinking budget.** `INKLING_THINK_BUDGET=N` (default `0` = off; `200` in `-demo` mode) caps the thinking part of each scripted reply. When `N` thinking tokens (after `<|content_thinking|>`) have been generated and thinking has not ended, the sampled token is dropped and `<|end_message|><|message_model|><|content_text|>` is decoded in its place as one batch, after which the answer is sampled normally. The forced tokens count towards the context but not towards the tok/s timing. stderr gets `[think_budget] turn=K forced_close_at=N` when it fires.
 
 Other demo switches: `-demo` / `INKLING_DEMO=1`, `-script` / `INKLING_DEMO_SCRIPT`, `INKLING_DEMO_EXIT=1` (exit after generation as in bench runs).
 

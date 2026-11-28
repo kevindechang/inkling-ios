@@ -21,11 +21,12 @@
 int inkling_gen(int argc, char ** argv);
 
 // Demo UI hook implemented in inkling_run.cpp (called on the inference thread).
-// kinds: 0 status/progress, 1 prompt, 2 answer text chunk, 3 final stats, 4 thinking text chunk,
+// kinds: 0 status/progress, 1 prompt, 2 answer text chunk, 3 final stats, 4 thinking progress (text is always empty, n_tok = thinking
+//        tokens so far; shown as one "thinking\u2026 N tok" line),
 //        5 turn begin (script mode: text=user turn, n_tok=turn index 1-based, progress=turn count),
 //        6 turn end (n_tok=decoded tokens, tok_s, progress=TTFT s). In script mode kind 3 carries total tokens, average steady
 //        tok/s and peak RAM; its text is "done" or a "stopped: ..." note.
-// tok_s is the steady decode rate (tokens after the first 3 of the turn / their summed per-token llama_decode time), 0 = not
+// tok_s is the steady decode rate (all generated tokens, thinking + answer, after the first 3 of the turn / their summed per-token llama_decode time), 0 = not
 // available yet (shown as "—"). Time to first token (s, turn prefill start -> first generated token) arrives in `progress` of
 // status "generating" (once known), kinds 2/4 (0 = not yet known), kind 6 and the single-turn kind 3.
 typedef void (*inkling_ui_cb)(int kind, const char * text, int n_tok, double tok_s, double ram_mb, float progress);
@@ -50,7 +51,7 @@ static void detect_demo() {
         g_demo = g_demo_noargs = true;
         g_demo_args_store = {"gen", "-m", "models/inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf", "-ngl", "0", "-t", "2", "-tb", "4",
                              "-ub", "64", "-passes", "1", "-k", "4", "-lm", "none", "-lzm", "on", "-c", "8192", "-ctk", "q8_0",
-                             "-ctv", "q8_0", "-n", "320"};
+                             "-ctv", "q8_0", "-n", "600"};
         bool have_script = false;   // models/demo_script.txt => multi-turn chat, else the single-turn demo prompt
         @autoreleasepool {
             NSString * docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -83,8 +84,8 @@ static void demo_setenv() {
         for (auto & e : kv) setenv(e[0], e[1], 0);
     }
     static const char * const samp[][2] = {
-        {"INKLING_TEMP", "0.7"}, {"INKLING_TOP_K", "40"}, {"INKLING_TOP_P", "0.9"}, {"INKLING_MIN_P", "0.05"},
-        {"INKLING_REPEAT_PENALTY", "1.1"}, {"INKLING_REPEAT_LAST_N", "128"},
+        {"INKLING_TEMP", "0.35"}, {"INKLING_TOP_K", "40"}, {"INKLING_TOP_P", "0.9"}, {"INKLING_MIN_P", "0.05"},
+        {"INKLING_REPEAT_PENALTY", "1.08"}, {"INKLING_REPEAT_LAST_N", "128"},
     };
     for (auto & e : samp) setenv(e[0], e[1], 0);   // explicit env (and -temp etc. args) still win
 }
@@ -104,13 +105,14 @@ static void demo_setenv() {
     UILabel * _footer;                        // "NNN tok · decode XX.X tok/s (excl. first 3) · TTFT X.XX s" under that bubble
     NSMutableAttributedString * _modelAttr;
     BOOL _modelHasText;
+    BOOL _hasThink;                           // a "thinking\u2026 N tok" line leads the model bubble
+    int _thinkTok;
     NSString * _status;
     NSString * _finalNote;
     int _nTok, _turn, _turnCount, _turnsDone;
     double _tokS, _ram, _ttft;
     float _progress;
     bool _done, _script;
-    int _lastKind;
 }
 
 - (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleLightContent; }
@@ -139,7 +141,7 @@ static void demo_setenv() {
     UILabel * sub = [self makeLabel:[UIFont systemFontOfSize:14] color:dim lines:1];
     sub.text = @"iPhone 15 Pro \u00b7 on-device \u00b7 CPU";
     _stats = [self makeLabel:[UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightMedium]
-                       color:[UIColor colorWithRed:0.45 green:0.85 blue:0.60 alpha:1.0] lines:2];
+                       color:[UIColor colorWithRed:0.45 green:0.85 blue:0.60 alpha:1.0] lines:3];
     _stats.text = @"loading 0%";
 
     _scroll = [UIScrollView new];
@@ -177,7 +179,6 @@ static void demo_setenv() {
         [_chat.widthAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.widthAnchor],
     ]];
     _status = @"loading";
-    _lastKind = -1;
 }
 
 static NSString * extract_user_prompt(NSString * raw) {
@@ -204,10 +205,10 @@ static NSString * fmt_ttft(double v) { return v > 0 ? [NSString stringWithFormat
         line = _status;
     } else if (_done && _script) {
         NSString * head = (_finalNote.length && ![_finalNote isEqualToString:@"done"]) ? _finalNote : @"done";
-        line = [NSString stringWithFormat:@"%@ \u00b7 %d turns \u00b7 decode avg %@ tok/s (excl. first 3 tok/turn) \u00b7 peak RAM %.0f MB",
+        line = [NSString stringWithFormat:@"%@ \u00b7 %d turns \u00b7 decode avg %@ tok/s (all tokens, excl. first 3/turn) \u00b7 peak RAM %.0f MB",
                 head, _turnsDone, fmt_decode(_tokS), _ram];
     } else if (_done) {
-        line = [NSString stringWithFormat:@"done \u00b7 %d tok \u00b7 decode %@ tok/s (excl. first 3) \u00b7 TTFT %@ s \u00b7 RAM %.0f MB",
+        line = [NSString stringWithFormat:@"done \u00b7 %d tok \u00b7 decode %@ tok/s (all tokens, excl. first 3) \u00b7 TTFT %@ s \u00b7 RAM %.0f MB",
                 _nTok, fmt_decode(_tokS), fmt_ttft(_ttft), _ram];
     } else if (_script && [_status isEqualToString:@"prefill"]) {
         line = [NSString stringWithFormat:@"turn %d/%d \u00b7 prefill %.0f%% \u00b7 RAM %.0f MB", _turn, _turnCount, _progress * 100.0f, _ram];
@@ -278,6 +279,8 @@ static NSString * fmt_ttft(double v) { return v > 0 ? [NSString stringWithFormat
     UIView * b = [self bubbleWith:_modelLabel color:[UIColor colorWithWhite:0.14 alpha:1.0]];
     _footer = [self makeLabel:[UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightRegular]
                         color:[UIColor colorWithWhite:0.5 alpha:1.0] lines:1];
+    _footer.numberOfLines = 0;
+    _footer.lineBreakMode = NSLineBreakByWordWrapping;
     _footer.hidden = YES;
     UIStackView * col = [[UIStackView alloc] initWithArrangedSubviews:@[b, _footer]];
     col.translatesAutoresizingMaskIntoConstraints = NO;
@@ -295,7 +298,7 @@ static NSString * fmt_ttft(double v) { return v > 0 ? [NSString stringWithFormat
     [_chat addArrangedSubview:row];
     _modelAttr = [NSMutableAttributedString new];
     _modelHasText = NO;
-    _lastKind = -1;
+    _hasThink = NO; _thinkTok = 0;
 }
 
 - (void)beginTurn:(int)k of:(int)n user:(NSString *)user {
@@ -308,7 +311,7 @@ static NSString * fmt_ttft(double v) { return v > 0 ? [NSString stringWithFormat
 - (void)finishTurnTok:(int)n tokS:(double)tokS ttft:(double)ttft {
     if (!_modelLabel) return;
     if (!_modelHasText) _modelLabel.attributedText = [self dimString:@"(empty reply)"];
-    _footer.text = [NSString stringWithFormat:@"%d tok \u00b7 decode %@ tok/s (excl. first 3) \u00b7 TTFT %@ s",
+    _footer.text = [NSString stringWithFormat:@"%d tok \u00b7 decode %@ tok/s (all tokens, excl. first 3) \u00b7 TTFT %@ s",
                     n, fmt_decode(tokS), fmt_ttft(ttft)];
     _footer.hidden = NO;
     _modelLabel = nil; _footer = nil; _modelAttr = nil;
@@ -324,24 +327,33 @@ static NSString * fmt_ttft(double v) { return v > 0 ? [NSString stringWithFormat
     [self scrollToBottom];
 }
 
-- (void)appendChunk:(NSString *)chunk thinking:(BOOL)thinking {
+// Model bubble = optional dim "thinking\u2026 N tok" line (updated in place, thinking text is never shown) + streamed answer.
+- (void)renderModel {
     if (!_modelLabel) return;
-    UIColor * color = thinking ? [UIColor colorWithWhite:0.52 alpha:1.0] : [UIColor colorWithWhite:0.94 alpha:1.0];
-    UIFont * font = thinking ? [UIFont italicSystemFontOfSize:14] : [UIFont systemFontOfSize:17];
-    NSDictionary * attrs = @{NSForegroundColorAttributeName: color, NSFontAttributeName: font};
-    int kind = thinking ? UI_THINK : UI_TEXT;
-    if (_lastKind != kind) {
-        if (thinking) {
-            [_modelAttr appendAttributedString:[[NSAttributedString alloc] initWithString:@"thinking\u2026 " attributes:attrs]];
-        } else if (_lastKind == UI_THINK) {
-            [_modelAttr appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n\n" attributes:attrs]];
-        }
-        _lastKind = kind;
+    NSMutableAttributedString * out = [NSMutableAttributedString new];
+    if (_hasThink) [out appendAttributedString:[self dimString:[NSString stringWithFormat:@"thinking\u2026 %d tok", _thinkTok]]];
+    if (_modelAttr.length) {
+        if (_hasThink) [out appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:@{
+            NSFontAttributeName: [UIFont systemFontOfSize:17]}]];
+        [out appendAttributedString:_modelAttr];
     }
+    _modelLabel.attributedText = out;
+    [self scrollToBottom];
+}
+
+- (void)updateThinking:(int)n {
+    if (!_modelLabel) return;
+    _hasThink = YES; _thinkTok = n; _modelHasText = YES;
+    [self renderModel];
+}
+
+- (void)appendChunk:(NSString *)chunk {
+    if (!_modelLabel) return;
+    NSDictionary * attrs = @{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.94 alpha:1.0],
+                             NSFontAttributeName: [UIFont systemFontOfSize:17]};
     [_modelAttr appendAttributedString:[[NSAttributedString alloc] initWithString:chunk attributes:attrs]];
     _modelHasText = YES;
-    _modelLabel.attributedText = _modelAttr;
-    [self scrollToBottom];
+    [self renderModel];
 }
 
 - (void)handleKind:(int)kind text:(NSString *)text nTok:(int)n tokS:(double)tokS ramMB:(double)ram progress:(float)p {
@@ -372,7 +384,8 @@ static NSString * fmt_ttft(double v) { return v > 0 ? [NSString stringWithFormat
             break;
         case UI_TEXT:
         case UI_THINK:
-            if (text.length) [self appendChunk:text thinking:kind == UI_THINK];
+            if (kind == UI_THINK) [self updateThinking:n];   // n = thinking tokens so far; no text
+            else if (text.length) [self appendChunk:text];
             _status = @"generating";
             _nTok = n; _tokS = tokS; if (ram > 0) _ram = ram;
             if (p > 0) _ttft = p;
