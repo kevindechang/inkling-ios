@@ -26,6 +26,15 @@ Subset: 15 `GSM8K-Hard`, 10 `MATH-500`, 10 `Logic`, 10 `GPQA Diamond`, 20 `BFCL`
 | [`opt95_sc320`](quality_80item/opt95_sc320.json) ([`replies`](quality_80item/opt95_sc320_replies.jsonl)) (`OPT λ=0.95`) | `cap=320`, `e=0.20` | `73.3%` (11/15) | `30.0%` (3/10) | `10.0%` (1/10) | `30.0%` (3/10) | `60.0%` (12/20) | `46.7%` (7/15) | **`40.0%`** | `48.9%` | `249 / 293` | **`92.2%`** |
 | [`fmrd_v2_sc320`](quality_80item/fmrd_v2_sc320.json) ([`replies`](quality_80item/fmrd_v2_sc320_replies.jsonl)) (`CECAR=0`) | `cap=320`, `e=0.20` | `46.7%` (7/15) | `30.0%` (3/10) | `10.0%` (1/10) | `20.0%` (2/10) | `70.0%` (14/20) | `46.7%` (7/15) | `28.9%` | `48.5%` | `262 / 296` | `84.2%` |
 
+### 1a-v2. v2 GGUF (`9b6b87fd...bc351`) — Same 80 Items, Effort `0.45`
+
+v2 is the QAT working-set distillation of v1 ([`docs/V2.md`](../../docs/V2.md)). These rows run on the v2 file, so do **not** compare them with the v1 iPhone rows in §2. v2 has not been measured on the iPhone yet.
+
+| Arm (JSON / Predictions) | Route (cache / pin) | `GSM8K-Hard` | `MATH-500` | `Logic` | `GPQA` | `BFCL` | `IFEval` | Reas | Mean | Avg Think (`all / reas`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| [`v2_c000_e045`](quality_80item/v2_c000_e045.json) ([`replies`](quality_80item/v2_c000_e045_replies.jsonl)) | `CECAR=0` (2950 / 40) | `80.0%` (12/15) | `40.0%` (4/10) | `50.0%` (5/10) | `20.0%` (2/10) | `65.0%` (13/20) | `53.3%` (8/15) | `51.1%` | `56.5%` | `633 / 785` |
+| [`v2_opt95_e045`](quality_80item/v2_opt95_e045.json) ([`replies`](quality_80item/v2_opt95_e045_replies.jsonl)) | `OPT λ=0.95` (2700 / 36) | `73.3%` (11/15) | `40.0%` (4/10) | `40.0%` (4/10) | `10.0%` (1/10) | `55.0%` (11/20) | `66.7%` (10/15) | `44.4%` | `55.4%` | 708 / 786 |
+
 ### 1b. Larger Baselines, Reference Models & Stage 3 WSD-40 Ablation
 
 | Model / Configuration | Experts (RAM / Total) | Cache Hit Rate (`2750 MB`, `PIN=40`) | `GSM8K-Hard` | `MATH-500` | `Logic` | `GPQA` | `BFCL` | `IFEval` | Avg Think |

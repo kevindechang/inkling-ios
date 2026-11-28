@@ -77,3 +77,11 @@ Eliminating the gap between pruned RAM-resident runs (`v30`) and the unpruned `1
    - **Row-broadcast NEON `ADD`/`SUB`/`MUL`/`DIV`** (`row-bcast-neon.h`): replaces length-1 per-element `vDSP` calls with IEEE `vaddq`/`vsubq`/`vmulq`/`vdivq` (`2,121,548` checks, `0` mismatches; `8.4×` per-call `MUL` speedup on Mac graph profile).
    - **Fused `SiTU` (`GGML_GLU_OP_SITU`, `situ-neon.h`, `GGML_SITU_FAST=accel`):** Collapses Inkling 2's 9-node `SiTU` (`beta * tanh(gate/beta) * sigmoid(gate) * lb * tanh(up/lb)`) chain per layer into 1 op using Apple Accelerate `vvtanhf`/`vvexpf` (`3.10×` faster `GLU`), bringing A17 Pro zero-miss decode down to **`30–31 ms`** (`33 tok/s` compute ceiling) with exact `200K` vocab (`LLAMA_LM_HEAD_SHORTLIST=off`).
 6. **Reversible Offline Pre-Repacking (`tools/prerepack_exps.cpp`, `GGML_MMID_PREREPACKED=1`):** Every expert tensor (`Q2_K`, `Q2_0`, `Q4_0`, `Q4_K`, `IQ4_NL`) has the exact same byte count in raw and repacked layouts (`static_assert` in `repack.h`). Pre-repacking offline zeroes runtime `repack_ms` (`438–907 ms → 0.0 ms` in decode) and speeds up prefill (`5.17 → 4.14–4.50 s`) and miss-heavy multi-topic decode (`17.46 → 18.36 tok/s`) with a journaled bit-exact `--unpack` path.
+
+## 8. v2 — QAT Working-Set Distillation and the Pareto Cliff
+
+v2 ([`docs/V2.md`](V2.md)) keeps the v1 file layout and runtime unchanged, and retrains on top of the shipped quantized weights (QAT).
+
+The main systems lesson is a **Pareto cliff** in router working-set concentration. With a fixed Hot-40 set per layer, a gently bounded cold-expert bias (cold traffic 62% → 37% on the training distribution) improved every distillation metric. Driving cold traffic to 5–6% raised the tool/instruction KL by about 3×, because specialist experts outside the pinned set become unreachable.
+
+A second lesson: training-time cold fraction did not predict runtime cache misses in `llama.cpp`. v2 still relies on per-layer CECAR (`OPT λ=0.95`) for its miss rate. The trained router bias alone is not enough.

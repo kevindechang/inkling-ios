@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "llama.cpp" / "gguf-py"))
+sys.path.insert(0, str(ROOT / "third_party" / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
 LORA_TARGETS = {
@@ -449,7 +449,7 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path)
     ap.add_argument("--base-gguf", type=Path, default=Path("./models/varloop-stage2-v1.gguf"))
     ap.add_argument("--imatrix", type=Path, default=Path("./models/imatrix-TML-d24-varloop-research.gguf"))
-    ap.add_argument("--libggml", type=Path, default=ROOT / "llama.cpp/build/bin/libggml-base.dylib")
+    ap.add_argument("--libggml", type=Path, default=ROOT / "third_party/llama.cpp/build/bin/libggml-base.dylib")
     ap.add_argument("--out", type=Path, default=Path("./models/varloop-stage3-wsd40.gguf"))
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()

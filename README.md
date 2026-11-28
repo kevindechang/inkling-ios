@@ -5,14 +5,34 @@
 - **Published GGUF Weights (Apache 2.0):** [`kevinexus/Inkling-2-FlashPin-26B-GGUF`](https://huggingface.co/kevinexus/Inkling-2-FlashPin-26B-GGUF)
   - File: `inkling2-26b-flashpin-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, `9.39 GiB`, all `128/128` experts retained)
   - SHA-256: `6d856056c0ff323711a487233dc5c63425f1896547803c38aac6c5f39d2acf09`
-- **Raw Verification Artifacts:** [`eval/results/iphone15pro_v35/`](eval/results/iphone15pro_v35/) (every `[tok]`, RAM footprint, `[mmid]`, `[warm_ttft]`, generated text, and thermal reading) + [`eval/results/quality_80item/`](eval/results/quality_80item/) (raw deterministic JSON summaries **and all 480 per-example `*_replies.jsonl` model predictions**) + exact prompt files in [`eval/results/iphone15pro_v35/prompts/`](eval/results/iphone15pro_v35/prompts/).
+  - **v2 (quality update, same layout):** `inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf` (`10,080,548,288` bytes, all `128/128` experts retained), SHA-256 `9b6b87fdb8fa01deb3b69ffbee6e59b98ecea65b1f3305d5fbb9db3d3bebc351`. See [v2 below](#v2-quality-update-mac-measured-iphone-pending) and [`docs/V2.md`](docs/V2.md).
+- **Raw Verification Artifacts:** [`eval/results/iphone15pro_v35/`](eval/results/iphone15pro_v35/) (every `[tok]`, RAM footprint, `[mmid]`, `[warm_ttft]`, generated text, and thermal reading) + [`eval/results/quality_80item/`](eval/results/quality_80item/) (raw deterministic JSON summaries **and all 640 per-example `*_replies.jsonl` model predictions across v1 and v2**) + [`eval/results/mac_v1_vs_v2/`](eval/results/mac_v1_vs_v2/) + [`eval/results/v2_training/`](eval/results/v2_training/) + exact prompt files in [`eval/results/iphone15pro_v35/prompts/`](eval/results/iphone15pro_v35/prompts/).
 
 > **Explicit Scope & Lineage (Read Before Judging):**
 > 1. **Base Model & Shape:** Derived from Apache-2.0 [`thinkingmachines/TML-d24-varloop-research`](https://huggingface.co/thinkingmachines/TML-d24-varloop-research) (the 26.4B variable-loop research sibling of Inkling 2, `inkling2_loop`, 24 blocks, 128 experts/layer) — **not** the fixed 3-pass Inkling 2 Mini checkpoint. Distilled and run at **1 loop pass, top-4 experts (`-passes 1 -k 4`)** with **zero experts pruned (`128/128` intact)**.
 > 2. **Artifact Identity (`prepack=0` vs `prepack=1`):** Every quality eval and every `prepack=0` iPhone row (`v35a`–`v35d`, `v35_mix`, including the **`23.43 tok/s`** exact-head headline) runs directly on the **published byte-exact GGUF** (`SHA-256: 6d856056c0ff323711a487233dc5c63425f1896547803c38aac6c5f39d2acf09`). The `prepack=1` rows (`v35e`–`v35g`) run on the **logically equivalent, losslessly pre-repacked** layout generated deterministically from that file via `tools/prerepack_exps --pack` (same `10,080,548,288` byte size, mathematically identical weights, bit-reversible via `--unpack` back to `6d856056...2acf09`). All rows use `LLAMA_LM_HEAD_SHORTLIST=off` (exact `200,058`-token vocab) unless explicitly marked `LOSSY`.
 > 3. **Timing Definition (`[warm_ttft]`):** In [`ios/inkling_run.cpp`](ios/inkling_run.cpp), `[warm_ttft]` times `llama_decode` over the 40-token second-turn prompt up through computing the final prompt token's greedy logit (`llama_batch_get_one`), on an already-warm expert cache after `llama_memory_clear`. It does **not** include detokenization (~0.1 ms), app launch, or cold model load — so it is strictly **warm prompt-prefill / first-logit latency**, not cold end-to-end TTFT.
 > 4. **Harness Requirements:** `ios/` builds `InklingBench`, a minimal **CLI systems benchmark harness** (not a consumer SwiftUI chat app). Building and sideloading on a physical iPhone requires an Apple Developer provisioning profile with the `com.apple.developer.kernel.increased-memory-limit` entitlement.
-> 5. **Total Cloud Compute Spent:** `$46.09 / $60.00` (AWS EC2 L40S for KL sweep + Stage 2/3 distillation; all Phase 2 kernel, router, and iPhone work was `$0` local).
+> 5. **Total Cloud Compute Spent:** `$58.60 / $60.00`. v1 used `$46.09` (AWS L40S for the KL sweep and Stage 2/3 distillation). The v2 QAT runs used `$12.51` (SageMaker `ml.g6e.4xlarge` Spot). All kernel, merge, evaluation and iPhone work was `$0` local.
+> 6. **v1 vs v2:** Every iPhone row in this README was measured on **v1** (`6d856056...`). **v2 has not been benchmarked on the iPhone yet.** The v2 numbers below were measured on a Mac.
+
+---
+
+## v2 Quality Update (Mac-measured, iPhone pending)
+
+v2 retrains v1 with quantization-aware working-set distillation (`qat40pareto`, 220 steps, `$12.51`). The layout, size, Hot-40 order and runtime are identical to v1, and all `128/128` experts are intact. Full details, training curves and limitations are in [`docs/V2.md`](docs/V2.md).
+
+Quality uses the same 80 item IDs and scorers as v1, effort `0.45`, uncapped thinking:
+
+| Model / arm | Route (cache / pin) | GSM8K-Hard | MATH-500 | Logic | GPQA | Reas (45) | BFCL | IFEval | Mean |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| v1 [`opt95_e045`](eval/results/quality_80item/opt95_e045.json) | OPT λ=0.95 (3000 / 32) | 11/15 | 3/10 | 2/10 | 2/10 | 18/45 (40.0%) | 15/20 | 7/15 | 53.9% |
+| v2 [`v2_c000_e045`](eval/results/quality_80item/v2_c000_e045.json) | CECAR=0 (2950 / 40) | 12/15 | 4/10 | 5/10 | 2/10 | 23/45 (51.1%) | 13/20 | 8/15 | 56.5% |
+| v2 [`v2_opt95_e045`](eval/results/quality_80item/v2_opt95_e045.json) | OPT λ=0.95 (2700 / 36, `v35a` route) | 11/15 | 4/10 | 4/10 | 1/10 | 20/45 (44.4%) | 11/20 | 10/15 | 55.4% |
+
+- **Small samples:** each of MATH-500, Logic and GPQA has only 10 items. The full 236-item run on v2 is still pending.
+- **Runtime speed (Mac, identical settings):** With OPT λ=0.95, v2 reads 11.3 / 11.9 expert slices per token on `p_math` / `v34_mix`, vs 10.8 / 13.1 for v1 ([logs](eval/results/mac_v1_vs_v2/)). v2 therefore needs the same cache-aware routing as v1. Its trained router bias did **not** reduce runtime misses on its own.
+- **Training finding:** Pushing the router below about 30% cold traffic raised tool/instruction KL about 3× (`0.17 → 0.49`). A bounded bias (62% → 37% cold) improved every distillation metric ([`docs/V2.md` §2](docs/V2.md#2-finding-the-working-set-pareto-cliff)).
 
 ---
 
@@ -169,6 +189,8 @@ To eliminate runtime CPU repacking on miss-heavy / multi-topic workloads (`repac
 - [`eval/`](eval/) — Public 271-item suite specification (`suite_spec.json`), full scoreboards (`results/summary.md`), raw sanitized iPhone 15 Pro `v35` telemetry logs + prompt files (`results/iphone15pro_v35/`), and raw 80-item quality JSONs (`results/quality_80item/`)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — System architecture & roofline analysis
 - [`docs/LOG.md`](docs/LOG.md) — Complete chronological engineering log (every experiment, number, cost, and dead end)
+- [`docs/V2.md`](docs/V2.md) — v2 QAT working-set distillation: recipe, Pareto-cliff training curves, N=80 quality, Mac cache behaviour, open issues
+- v2 code: [`train/distill_v2_sota.py`](train/distill_v2_sota.py), [`train/sm/`](train/sm/) (SageMaker launcher/entry), [`train/hot_plan_40.json`](train/hot_plan_40.json), [`quant/merge_v2_local.py`](quant/merge_v2_local.py); v2 artifacts: [`eval/results/v2_training/`](eval/results/v2_training/), [`eval/results/mac_v1_vs_v2/`](eval/results/mac_v1_vs_v2/)
 
 ---
 

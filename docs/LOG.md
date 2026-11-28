@@ -152,3 +152,24 @@ Complete, transparent chronological record of every experiment, measured number,
 - **80-item concise thinking (`soft_cap=320`, effort `0.2`, n=80 = 15 GSM8K-Hard + 10 MATH-500 + 10 Logic + 10 GPQA + 20 BFCL + 15 IFEval).** `c000` CECAR off: GSM `60.0`, MATH `30.0`, Logic `10.0`, GPQA `10.0`, BFCL `80.0`, IFEval `66.7`, reas `31.1`, mean `59.3`, think `245/293`, hit `75.3%`. `opt85`: `60.0 / 30.0 / 10.0 / 30.0 / 60.0 / 60.0`, reas `35.6`, mean `51.9`, think `250/294`, hit `90.2%`. `opt95`: `73.3 / 30.0 / 10.0 / 30.0 / 60.0 / 46.7`, reas `40.0`, mean `48.9`, think `249/293`, hit `92.2%`. `fmrd_v2` CECAR off: `46.7 / 30.0 / 10.0 / 20.0 / 70.0 / 46.7`, reas `28.9`, mean `48.5`, think `262/296`, hit `84.2%`.
 - **EAGLE-v3.** Mac held-out Q4 2-layer draft: `alpha1_gen=0.551`, `alpha2_cond_gen=0.578`, expected `1.55` tok/step at B=2. iPhone `K=1` on the 66-token prompt: `12.84 tok/s` (`77.9 ms/tok`, `tok/step=1.389`, `alpha1=38.9%`, draft `1.25 ms`, verify `106.60 ms`, footprint `4031 MB`). Greedy B=1 on that prompt was `18.45 tok/s`. The verify step is the cost, so this drafter is slower than B=1 on the phone.
 
+
+## 2026-11-28 — v2: QAT working-set distillation (`qat40pareto`) and the Pareto cliff
+
+Full write-up: [`docs/V2.md`](V2.md).
+
+- **Diagnosing the WSD-40 v1 regression.** Stage 3 WSD-40 crushed cold traffic to 1.4%. `eval_ro_kl` jumped `0.20 → 0.32` between steps 100 and 150. That run had no `run3` init and no QAT against the shipped quantized weights, plus a chat-template mismatch on system/tool turns.
+- **New trainer `train/distill_v2_sota.py`.** It trains against the shipped v1 GGUF's quantized Hot-40 experts, attention and `lm_head` (QAT), initializes from `run3` with exact delta subtraction, and adds 105 F32 `AttnRes`/RMSNorm deltas. Data is 15 Parquet streams rendered through `apply_chat_template`. Logic/science share rose from about 3% to about 13%.
+- **`qat40sota1`.** Stopped after 6 min (`$0.44`): a `camel-ai` `.zip` dataset loaded at 5 rows/s. It was replaced with Parquet `OpenThoughts-114k`, `LogiQA-2.0`, `FOLIO`, `SciQ`, `ARC-Challenge` and `MMLU-aux`.
+- **`qat40sota2` (target cold 6.5%, bias floor −0.75).**
+  - Step 50 (36.5% cold): `eval_kl 0.2777`, `tool_if_kl 0.1821`.
+  - As cold traffic fell, tool/IF KL rose steadily: `0.3183` at 14.6% cold, `0.4856` at 5.7%, `0.4936` at step 300.
+  - The decision gate stopped the run at step 300 (`$6.75`).
+- **`qat40pareto` (target cold 28%, bias floor −0.18, cold loss 0.015, 220 steps, `$5.32`).**
+  - Step 200: cold `62.3% → 37.1%`, `eval_kl 0.3361 → 0.2644`, `eval_ro_kl 0.1527 → 0.1346`, `tool_if_kl 0.1707 → 0.1725`, `layer_mse 0.2967 → 0.2331`.
+  - Total AWS spend for the project: `$58.60` of the `$60` budget.
+- **Local merge (`quant/merge_v2_local.py`, 35.8 min, `$0`).** Output `inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf`, `10,080,548,288` B, SHA-256 `9b6b87fdb8fa01deb3b69ffbee6e59b98ecea65b1f3305d5fbb9db3d3bebc351`.
+  - Router cos vs v1: `0.9986–0.9991`.
+  - `exp_probs_b` hot−cold gap: `0.18–0.25` per layer (v1: `0.00–0.07`).
+- **N=80, same items as v1, effort 0.45.** v2 with `CECAR=0`: GSM8K-Hard 12/15, MATH-500 4/10, Logic 5/10, GPQA 2/10 (Reas 23/45 = 51.1%), BFCL 13/20, IFEval 8/15, Mean 56.5%. v1 with OPT λ=0.95: Reas 18/45 = 40.0%, BFCL 15/20, IFEval 7/15, Mean 53.9%. The v2 OPT λ=0.95 row is in `docs/V2.md` §3.
+- **Negative / open result.** On the Mac at `2700/36`, v2 at `CECAR=0` does **not** have fewer cache misses than v1 (`p_math` 38.4 vs 30.4 miss/tok; `v34_mix` 47.9 vs 48.4). The training-time cold reduction does not reach the runtime. With OPT λ=0.95 the two are on par (11.3 vs 10.8 and 11.9 vs 13.1 miss/tok).
+- **iPhone.** Two Wi-Fi `devicectl` copies of the v2 GGUF failed (`ECONNRESET`). **There is no v2 iPhone measurement yet**, and the README makes no v2 iPhone speed claim.
