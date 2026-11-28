@@ -192,6 +192,28 @@ To eliminate runtime CPU repacking on miss-heavy / multi-topic workloads (`repac
 - [`docs/V2.md`](docs/V2.md) — v2 QAT working-set distillation: recipe, Pareto-cliff training curves, N=80 quality, Mac cache behaviour, open issues
 - v2 code: [`train/distill_v2_sota.py`](train/distill_v2_sota.py), [`train/sm/`](train/sm/) (SageMaker launcher/entry), [`train/hot_plan_40.json`](train/hot_plan_40.json), [`quant/merge_v2_local.py`](quant/merge_v2_local.py); v2 artifacts: [`eval/results/v2_training/`](eval/results/v2_training/), [`eval/results/mac_v1_vs_v2/`](eval/results/mac_v1_vs_v2/)
 
+## Demo mode (on-screen UI)
+
+Tap the app icon (no launch arguments) to run the demo: the app runs `gen` with `models/inkling2-26b-flashpin-v2-1p-hot40-q2k-i8mm.gguf` and `models/demo_prompt.txt` (falls back to a built-in prompt if the file is missing), applies the `v35d` environment (`GGML_MMID_*`, `INKLING_ALLOW_ONE_PASS=1`, `INKLING_GREEDY_SKIP_SOFTCAP=1`, ... set only if not already in the environment), and shows a dark screen with the title, a live stats line (status, tokens, tok/s, RAM), the user prompt, and the generated text streaming live. When generation finishes the app stays open (for screen recording) unless `INKLING_DEMO_EXIT=1`.
+
+You can also launch demo mode from `ios/phone_env.sh` with explicit args by adding `-demo` to the `gen` command or setting `INKLING_DEMO=1`. The prompt file must already contain the chat template, e.g. `<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>QUESTION<|end_message|><|message_model|>`.
+
+Sampling is off by default (greedy, fused argmax head). It is enabled when `temp > 0` or `repeat_penalty != 1`; the EAGLE path is disabled while sampling. Args win over env vars; in demo mode, unset values take the demo defaults.
+
+| Arg | Env var | Default | Demo default |
+|---|---|---|---|
+| `-temp F` | `INKLING_TEMP` | 0 | 0.7 |
+| `-top-k N` | `INKLING_TOP_K` | 0 (off) | 40 |
+| `-top-p F` | `INKLING_TOP_P` | 1.0 | 0.9 |
+| `-min-p F` | `INKLING_MIN_P` | 0.0 | 0.05 |
+| `-repeat-penalty F` | `INKLING_REPEAT_PENALTY` | 1.0 | 1.1 |
+| `-repeat-last-n N` | `INKLING_REPEAT_LAST_N` | 64 | 128 |
+| `-seed N` | `INKLING_SEED` | random | random |
+
+Other demo switches: `-demo` / `INKLING_DEMO=1`, `INKLING_DEMO_EXIT=1` (exit after generation as in bench runs).
+
+Bench runs (no `-demo`, temp 0, repeat penalty 1) are unchanged: same greedy code path, same logs, same exit behaviour.
+
 ---
 
 ## License
